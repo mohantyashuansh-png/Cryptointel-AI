@@ -1,0 +1,4444 @@
+================================================================================
+File: .\.env.example
+================================================================================
+
+NEO4J_URI=neo4j+s://your_neo4j_uri
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=password
+
+GEMINI_API_KEY=your_gemini_key
+
+GROQ_API_KEY_1=your_groq_key_1
+GROQ_API_KEY_2=your_groq_key_2
+GROQ_API_KEY_3=your_groq_key_3
+GROQ_API_KEY_4=your_groq_key_4
+
+GEMINI_API_KEY_1=your_gemini_key_1
+GEMINI_API_KEY_2=your_gemini_key_2
+GEMINI_API_KEY_3=your_gemini_key_3
+GEMINI_API_KEY_4=your_gemini_key_4
+
+
+================================================================================
+File: .\.gitignore
+================================================================================
+
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+
+================================================================================
+File: .\blockchain_forensics.py
+================================================================================
+
+import requests
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
+
+def trace_wallet(wallet_address, crypto_type):
+    """
+    Fetches the last few transactions for a wallet from public blockchains.
+    Returns a list of dicts: [{"from": "addr", "to": "addr", "value": float_amount, "hash": "txhash"}]
+    """
+    transactions = []
+    print(f"[FORENSICS] Tracing {crypto_type} wallet {wallet_address} on-chain...")
+    
+    try:
+        if crypto_type.upper() == "BTC":
+            # Blockchain.info API (No auth required)
+            url = f"https://blockchain.info/rawaddr/{wallet_address}?limit=5"
+            res = requests.get(url, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                for tx in data.get("txs", []):
+                    tx_hash = tx.get("hash")
+                    # Simplified logic: take the first input and first output
+                    inputs = tx.get("inputs", [])
+                    outputs = tx.get("out", [])
+                    
+                    sender = inputs[0].get("prev_out", {}).get("addr") if inputs else "Unknown_Sender"
+                    receiver = outputs[0].get("addr") if outputs else "Unknown_Receiver"
+                    value_satoshi = outputs[0].get("value", 0) if outputs else 0
+                    
+                    # Convert Satoshi to BTC
+                    value_btc = value_satoshi / 100000000.0
+                    
+                    transactions.append({
+                        "from": sender,
+                        "to": receiver,
+                        "value": value_btc,
+                        "hash": tx_hash
+                    })
+        
+        elif crypto_type.upper() == "ETH":
+            if not ETHERSCAN_API_KEY:
+                print("[!] No Etherscan API key found. Skipping ETH trace.")
+                return []
+                
+            # Etherscan API (Requires Auth)
+            url = f"https://api.etherscan.io/api?module=account&action=txlist&address={wallet_address}&startblock=0&endblock=99999999&page=1&offset=5&sort=desc&apikey={ETHERSCAN_API_KEY}"
+            res = requests.get(url, timeout=10)
+            if res.status_code == 200:
+                data = res.json()
+                if data.get("status") == "1":
+                    for tx in data.get("result", []):
+                        sender = tx.get("from")
+                        receiver = tx.get("to")
+                        value_wei = float(tx.get("value", 0))
+                        
+                        # Convert Wei to ETH
+                        value_eth = value_wei / 1e18
+                        
+                        transactions.append({
+                            "from": sender,
+                            "to": receiver,
+                            "value": value_eth,
+                            "hash": tx.get("hash")
+                        })
+    except Exception as e:
+        print(f"[!] Error tracing wallet {wallet_address}: {e}")
+        
+    return transactions
+
+
+================================================================================
+File: .\engine.py
+================================================================================
+
+"""
+CryptoIntel AI — Core Investigation Engine
+4-agent OSINT swarm: parses raw text, scores risk, summarizes context,
+and compiles a graph-ready JSON payload.
+
+NOTE ON SAMPLE DATA:
+The sample_scraped_intel below is 100% fictional — fake wallet, fake name,
+fake phone/email/bank account. Do NOT replace it with a real, identifiable
+wallet address or real personal details, even for a demo. Real addresses
+plus fabricated "criminal" labels can misattribute crime to real entities
+on a public chain. Keep all demo/test data clearly synthetic.
+"""
+
+import os
+import re
+import json
+from dotenv import load_dotenv
+from crewai import Agent, Task, Crew, Process, LLM
+import crewai.llms.cache as _crewai_cache
+
+# Monkey-patch to fix Groq unsupported cache_breakpoint error in CrewAI v1.14
+_crewai_cache.mark_cache_breakpoint = lambda msg: msg
+
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+load_dotenv()  # reads GEMINI_API_KEY from a local .env file (never hardcode keys in source)
+
+# ---------------------------------------------------------------------------
+# 1. Cloud LLM Initialization & Fallbacks
+# ---------------------------------------------------------------------------
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+GEMINI_KEYS = [
+    os.environ.get("GEMINI_API_KEY_1", GEMINI_API_KEY),
+    os.environ.get("GEMINI_API_KEY_2", GEMINI_API_KEY),
+    os.environ.get("GEMINI_API_KEY_3", GEMINI_API_KEY),
+    os.environ.get("GEMINI_API_KEY_4", GEMINI_API_KEY),
+]
+GROQ_KEYS = [
+    os.environ.get("GROQ_API_KEY_1"),
+    os.environ.get("GROQ_API_KEY_2"),
+    os.environ.get("GROQ_API_KEY_3"),
+    os.environ.get("GROQ_API_KEY_4"),
+]
+
+if not GEMINI_API_KEY or not all(GROQ_KEYS):
+    raise RuntimeError(
+        "Missing API keys. Ensure GEMINI_API_KEY and GROQ_API_KEY_1 through 4 are in .env"
+    )
+
+# 4 Independent Gemini LLMs natively via CrewAI
+llm_1 = LLM(model="gemini/gemini-3.1-flash-lite", api_key=GEMINI_KEYS[0], temperature=0.1)
+llm_2 = LLM(model="gemini/gemini-3.1-flash-lite", api_key=GEMINI_KEYS[1], temperature=0.1)
+llm_3 = LLM(model="gemini/gemini-3.1-flash-lite", api_key=GEMINI_KEYS[2], temperature=0.1)
+llm_4 = LLM(model="gemini/gemini-3.1-flash-lite", api_key=GEMINI_KEYS[3], temperature=0.1)
+
+# The Fallback LLMs (Groq) - distributed across 4 keys to avoid limits
+fallback_llm_1 = LLM(model="groq/llama-3.3-70b-versatile", api_key=GROQ_KEYS[0], temperature=0.1)
+fallback_llm_2 = LLM(model="groq/llama-3.3-70b-versatile", api_key=GROQ_KEYS[1], temperature=0.1)
+fallback_llm_3 = LLM(model="groq/llama-3.3-70b-versatile", api_key=GROQ_KEYS[2], temperature=0.1)
+fallback_llm_4 = LLM(model="groq/llama-3.3-70b-versatile", api_key=GROQ_KEYS[3], temperature=0.1)
+
+# ---------------------------------------------------------------------------
+# 2. Sample Input — FICTIONAL DEMO DATA ONLY
+# ---------------------------------------------------------------------------
+sample_scraped_intel = """
+[SOURCE: SIMULATED-FORUM-LEAK] [DATE: 2026-03-14]
+User 'MockAlias_Test01' is allegedly coordinating illegal contraband sales
+on a fictional darknet forum (this is synthetic demo data, not a real case).
+Wallet (fake/test format): bc1qexampletest0000000000000000000xyzdemo
+Contact (fake): +1 555-0100 or email demo.suspect@example.test
+Fiat payout routed through fictional bank account: 0000-TEST-9999
+"""
+
+# ---------------------------------------------------------------------------
+# 3. Deterministic Regex Wallet Extraction (fast path, no LLM needed)
+# ---------------------------------------------------------------------------
+def extract_wallets_via_regex(text: str):
+    wallets = []
+    
+    # Bitcoin (Legacy, P2SH, Bech32)
+    btc = re.findall(r'\b(1[a-km-zA-HJ-NP-Z1-9]{25,34}|3[a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-zA-HJ-NP-Z0-9]{25,39})\b', text)
+    for w in btc: wallets.append({"address": w, "crypto_type": "BTC"})
+        
+    # Ethereum / BSC / Polygon
+    eth = re.findall(r'\b(0x[a-fA-F0-9]{40})\b', text)
+    for w in eth: wallets.append({"address": w, "crypto_type": "ETH"})
+        
+    # Monero (XMR) - Huge flex for dark web
+    xmr = re.findall(r'\b(4[0-9AB][1-9A-HJ-NP-Za-km-z]{93})\b', text)
+    for w in xmr: wallets.append({"address": w, "crypto_type": "XMR"})
+        
+    # Tron (TRX) - Heavily used for USDT terror financing
+    trx = re.findall(r'\b(T[A-Za-z1-9]{33})\b', text)
+    for w in trx: wallets.append({"address": w, "crypto_type": "TRX"})
+
+    # Litecoin (LTC)
+    ltc = re.findall(r'\b(L[a-km-zA-HJ-NP-Z1-9]{26,33}|M[a-km-zA-HJ-NP-Z1-9]{26,33}|ltc1[a-zA-HJ-NP-Z0-9]{25,39})\b', text)
+    for w in ltc: wallets.append({"address": w, "crypto_type": "LTC"})
+
+    # Dogecoin (DOGE)
+    doge = re.findall(r'\b(D[5-9A-HJ-NP-U]{1}[1-9A-HJ-NP-Za-km-z]{32})\b', text)
+    for w in doge: wallets.append({"address": w, "crypto_type": "DOGE"})
+
+    # Ripple (XRP)
+    xrp = re.findall(r'\b(r[0-9a-zA-Z]{24,34})\b', text)
+    for w in xrp: wallets.append({"address": w, "crypto_type": "XRP"})
+
+    # Solana (SOL)
+    sol = re.findall(r'\b([1-9A-HJ-NP-Za-km-z]{32,44})\b', text)
+    for w in sol:
+        # Avoid matching common base58 strings that aren't wallets (like pure digits). Basic heuristic:
+        if not re.match(r'^\d+$', w) and not re.match(r'^[a-z]+$', w) and not re.match(r'^[A-Z]+$', w):
+            wallets.append({"address": w, "crypto_type": "SOL"})
+
+    # Zcash (ZEC)
+    zec = re.findall(r'\b(t1[a-zA-Z0-9]{33})\b', text)
+    for w in zec: wallets.append({"address": w, "crypto_type": "ZEC"})
+
+    # Dash
+    dash = re.findall(r'\b(X[1-9A-HJ-NP-Za-km-z]{33})\b', text)
+    for w in dash: wallets.append({"address": w, "crypto_type": "DASH"})
+
+    return wallets if wallets else [{"address": "No explicit wallet detected", "crypto_type": "Unknown"}]
+
+
+# ---------------------------------------------------------------------------
+# 4. Define the 4-Agent OSINT Swarm
+# ---------------------------------------------------------------------------
+osint_parser = Agent(
+    role="OSINT Named Entity Extractor",
+    goal="Extract candidate crypto wallets, aliases, real names, physical addresses, emails, phone numbers, and bank details from raw text.",
+    backstory=(
+        "You are a digital forensics parser used in a hackathon demo. "
+        "You isolate structured entities from messy scraped text. "
+        "All input in this demo is simulated/synthetic data."
+    ),
+    llm=llm_1,
+    verbose=True,
+)
+
+risk_scorer = Agent(
+    role="Quantitative Risk Matrix Engineer & Categorizer",
+    goal="Evaluate context keywords, assign explicit mathematical risk additions based on a fixed rubric, and cluster the activity into a specific threat category (e.g., Narcotics, Terror Financing, Money Laundering, Scams, or Unknown).",
+    backstory=(
+        "You are a compliance-style risk auditor for a demo tool. "
+        "You apply a fixed point rubric mechanically, show your math, and explicitly tag the activity with a category."
+    ),
+    llm=llm_2,
+    verbose=True,
+)
+
+context_interpreter = Agent(
+    role="LLM Context Summarizer",
+    goal="Generate a concise 2-sentence tactical overview of what the (simulated) text describes.",
+    backstory=(
+        "You write short, neutral, human-readable summaries for a demo "
+        "intelligence dashboard. You always note when data is simulated."
+    ),
+    llm=llm_3,
+    verbose=True,
+)
+
+matrix_compiler = Agent(
+    role="JSON Matrix Architect",
+    goal="Structure all collected data into a single clean, strictly valid JSON object.",
+    backstory=(
+        "You are a strict backend data-structuring engineer. "
+        "You output ONLY valid JSON — double-quoted keys and strings, "
+        "no trailing commas, no markdown fences, no commentary."
+    ),
+    llm=llm_4,
+    verbose=True,
+)
+
+# ---------------------------------------------------------------------------
+# 5. Task Pipeline
+# ---------------------------------------------------------------------------
+t1 = Task(
+    description=f"Parse this scraped raw web log: {sample_scraped_intel}. "
+                f"Extract the wallet address, alias, real name, physical address, phone, email, and bank account if present.",
+    expected_output="A list of all discovered entities (wallet, alias, real name, address, phone, email, bank account).",
+    agent=osint_parser,
+)
+
+t2 = Task(
+    description=(
+        "Using the entities and context from Task 1, calculate a strict numerical Risk Score "
+        "using this exact rubric:\n"
+        "- Base score if found on a suspect forum or dark web: +30\n"
+        "- If context contains keywords like 'illegal', 'contraband', 'drugs', or 'narcotics': +25\n"
+        "- If context contains keywords like 'terror', 'jihad', 'financing', or 'extremism': +35\n"
+        "- If context contains keywords like 'launder', 'clean', 'mixer', 'tumbler': +20\n"
+        "- If PII (phone or email) is linked to the activity: +15\n"
+        "- If fiat Bank account details are linked: +20\n"
+        "- If the address is Monero (XMR) or Zcash (ZEC) (privacy coins): +10\n"
+        "After calculating the score, explicitly determine the Category of the suspect activity "
+        "(e.g., 'Narcotics', 'Terror Financing', 'Money Laundering', 'Cybercrime', or 'Unknown').\n"
+        "Output the total sum, the calculation breakdown, and the final Category."
+    ),
+    expected_output="A final cumulative numerical score with calculation breakdown, and the explicitly assigned Category.",
+    agent=risk_scorer,
+)
+
+t3 = Task(
+    description="Write a neutral 2-sentence summary of where this data point appeared and what "
+                "it claims to be linked to. Note explicitly that this is simulated demo data.",
+    expected_output="A two-sentence plain-English summary.",
+    agent=context_interpreter,
+)
+
+t4 = Task(
+    description=(
+        "Compile everything from Tasks 1-3 into ONE raw JSON object. "
+        "Output ONLY valid JSON — double-quoted strings, no trailing commas, "
+        "no markdown code fences, no leading/trailing commentary. "
+        "Follow this shape exactly (values are illustrative) and MAKE SURE to include the 'category', 'crypto_type', 'source_url', and explicitly capture PII fields ('phone', 'email', 'bank_account', 'real_name', 'address') inside the properties of Entity/Suspect nodes if found:\n"
+        "{\n"
+        '  "nodes": [\n'
+        '    {"id": "wallet_address", "type": "Wallet", "crypto_type": "BTC/ETH/XMR/TRX/Unknown", "source_url": "url", "category": "Narcotics", "score": 90, "desc": "summary", "phone": "", "email": "", "bank_account": "", "real_name": "", "address": ""},\n'
+        '    {"id": "suspect_alias", "type": "Suspect", "crypto_type": "None", "source_url": "url", "category": "Narcotics", "score": 50, "desc": "PII Link", "phone": "+15551234", "email": "demo@test.com", "bank_account": "0000-TEST", "real_name": "John Doe", "address": "123 Fake St"}\n'
+        "  ],\n"
+        '  "edges": [\n'
+        '    {"from": "wallet_address", "to": "suspect_alias", "relation": "OWNED_BY"}\n'
+        "  ]\n"
+        "}"
+    ),
+    expected_output="A single valid raw JSON object string representing nodes and edges, including category and PII fields.",
+    agent=matrix_compiler,
+)
+
+
+# ---------------------------------------------------------------------------
+# 6. Robust JSON extraction from LLM output
+# ---------------------------------------------------------------------------
+def safe_parse_json(raw: str) -> dict:
+    """
+    Attempts to coerce LLM output into valid JSON without relying on a naive
+    '.replace(\"'\", '\"')' pass, which corrupts any apostrophe inside text
+    fields (e.g. "suspect's wallet"). Strategy:
+      1. Try strict json.loads on the raw string.
+      2. Strip markdown code fences if present, retry.
+      3. Extract the outermost {...} block via brace matching, retry.
+      4. Give up and return a structured error with the raw text attached.
+    """
+    candidates = [raw.strip()]
+
+    # Strip ```json ... ``` or ``` ... ``` fences if the model added them anyway
+    fenced = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.IGNORECASE | re.MULTILINE)
+    candidates.append(fenced.strip())
+
+    # Extract outermost {...} block by brace matching
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(raw[start:end + 1])
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    return {
+        "error": "JSON compilation anomaly: could not parse model output as valid JSON.",
+        "raw_output": raw,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 7. Pipeline Runner
+# ---------------------------------------------------------------------------
+def run_investigation_pipeline(raw_text: str, source_url: str = "Unknown") -> dict:
+    """Runs the full 4-agent crew against raw_text and returns a parsed dict."""
+    t1.description = f"Parse this scraped raw web log: {raw_text}. The source URL is: {source_url}"
+
+    crew = Crew(
+        agents=[osint_parser, risk_scorer, context_interpreter, matrix_compiler],
+        tasks=[t1, t2, t3, t4],
+        process=Process.sequential,
+    )
+
+    print("[CORE] Executing multi-agent intelligence extraction...")
+    try:
+        result = crew.kickoff()
+        agent_outputs = {
+            "osint": str(getattr(t1, 'output', '')),
+            "risk": str(getattr(t2, 'output', '')),
+            "context": str(getattr(t3, 'output', '')),
+            "matrix": str(getattr(t4, 'output', ''))
+        }
+    except Exception as e:
+        print(f"[WARNING] Primary LLM failed (Rate limit or error). Falling back to Groq (Llama-3.3-70b)...")
+        
+        # Instantiate NEW agents with the 4 distinct fallback LLMs to avoid rate limits and caching errors
+        fb_osint = Agent(role=osint_parser.role, goal=osint_parser.goal, backstory=osint_parser.backstory, llm=fallback_llm_1)
+        fb_scorer = Agent(role=risk_scorer.role, goal=risk_scorer.goal, backstory=risk_scorer.backstory, llm=fallback_llm_2)
+        fb_context = Agent(role=context_interpreter.role, goal=context_interpreter.goal, backstory=context_interpreter.backstory, llm=fallback_llm_3)
+        fb_matrix = Agent(role=matrix_compiler.role, goal=matrix_compiler.goal, backstory=matrix_compiler.backstory, llm=fallback_llm_4)
+
+        fb_t1 = Task(description=t1.description, expected_output=t1.expected_output, agent=fb_osint)
+        fb_t2 = Task(description=t2.description, expected_output=t2.expected_output, agent=fb_scorer)
+        fb_t3 = Task(description=t3.description, expected_output=t3.expected_output, agent=fb_context)
+        fb_t4 = Task(description=t4.description, expected_output=t4.expected_output, agent=fb_matrix)
+
+        fallback_crew = Crew(
+            agents=[fb_osint, fb_scorer, fb_context, fb_matrix],
+            tasks=[fb_t1, fb_t2, fb_t3, fb_t4],
+            process=Process.sequential,
+        )
+        result = fallback_crew.kickoff()
+        agent_outputs = {
+            "osint": str(getattr(fb_t1, 'output', '')),
+            "risk": str(getattr(fb_t2, 'output', '')),
+            "context": str(getattr(fb_t3, 'output', '')),
+            "matrix": str(getattr(fb_t4, 'output', ''))
+        }
+
+    raw_output = str(result)
+    parsed = safe_parse_json(raw_output)
+    if isinstance(parsed, dict):
+        parsed["agent_outputs"] = agent_outputs
+    return parsed
+
+
+if __name__ == "__main__":
+    # Quick manual test: python engine.py
+    output = run_investigation_pipeline(sample_scraped_intel)
+    print(json.dumps(output, indent=2))
+
+
+================================================================================
+File: .\evidence_out.json
+================================================================================
+
+
+
+================================================================================
+File: .\extract_code.py
+================================================================================
+
+import os
+import argparse
+
+def extract_all_code(directory, output_file="all_code.txt"):
+    """
+    Reads all code files in the given directory and combines them into a single text file.
+    Ignores common binary files, hidden folders, and virtual environments.
+    """
+    # Folders to ignore so we don't extract useless or massive files
+    ignore_dirs = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.idea', '.vscode', '.next', 'evidence_vault'}
+    
+    # Common non-text file extensions to ignore
+    ignore_exts = {
+        '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.mp4', '.mp3', 
+        '.zip', '.tar', '.gz', '.pdf', '.exe', '.dll', '.so', '.pyc', '.pkl'
+    }
+
+    # Specific files to ignore (like lock files or API keys)
+    ignore_files = {'package-lock.json', 'yarn.lock', '.env', '.env.local'}
+
+    if not os.path.exists(directory):
+        print(f"Error: Directory '{directory}' not found.")
+        return
+
+    with open(output_file, 'w', encoding='utf-8') as outfile:
+        # Walk through all folders and files in the directory
+        for root, dirs, files in os.walk(directory):
+            # Exclude ignored directories from the search
+            dirs[:] = [d for d in dirs if d not in ignore_dirs]
+
+            for file in files:
+                if file in ignore_files:
+                    continue
+                    
+                ext = os.path.splitext(file)[1].lower()
+                if ext in ignore_exts:
+                    continue
+                
+                # Make sure we don't try to extract the output file into itself
+                if file == output_file:
+                    continue
+
+                filepath = os.path.join(root, file)
+                
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as infile:
+                        content = infile.read()
+                        
+                        # Write a highly organized header for each file
+                        outfile.write("=" * 80 + "\n")
+                        outfile.write(f"File: {filepath}\n")
+                        outfile.write("=" * 80 + "\n\n")
+                        
+                        # Write the actual file content
+                        outfile.write(content)
+                        outfile.write("\n\n")
+                        
+                except Exception as e:
+                    # Catch errors for files that might not be plain text but don't have standard extensions
+                    print(f"Skipping {filepath} (Error reading as text)")
+
+    print(f"Successfully extracted all code into '{output_file}'.")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Combine all code files in a directory into a single text file.")
+    parser.add_argument("directory", nargs="?", default=".", help="The directory to scan (defaults to current folder).")
+    parser.add_argument("-o", "--output", default="all_code.txt", help="The output file name (defaults to all_code.txt).")
+    
+    args = parser.parse_args()
+    
+    extract_all_code(args.directory, args.output)
+
+
+================================================================================
+File: .\main.py
+================================================================================
+
+"""
+CryptoIntel AI — FastAPI Service Layer
+Wraps the 4-agent engine as a local HTTP API for the frontend/dashboard team.
+
+Run with:  python main.py
+Then POST to:  http://localhost:8000/api/v1/investigate
+Body:  {"raw_text": "...scraped text..."}
+"""
+
+import os
+import csv
+import io
+import sys
+import json
+import requests
+import hashlib
+from collections import deque
+from datetime import datetime
+from fastapi import FastAPI, Body, HTTPException, Response
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from blockchain_forensics import trace_wallet
+from pydantic import BaseModel
+from neo4j import GraphDatabase
+from dotenv import load_dotenv
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib import colors
+
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+    REPORTLAB_AVAILABLE = True
+except ImportError:
+    REPORTLAB_AVAILABLE = False
+
+from engine import run_investigation_pipeline, extract_wallets_via_regex
+
+load_dotenv()
+
+try:
+    import lancedb
+    from langchain_huggingface import HuggingFaceEmbeddings
+    # Initialize LanceDB
+    lancedb_client = lancedb.connect("./evidence_vault")
+    hf_embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+    print("[SYSTEM] LanceDB and HuggingFace Embeddings Initialized.")
+except Exception as e:
+    print(f"[ERROR] Failed to initialize LanceDB/Embeddings: {e}")
+    lancedb_client = None
+    hf_embeddings = None
+
+# Initialize Neo4j Driver
+NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USERNAME = os.environ.get("NEO4J_USERNAME", "neo4j")
+NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "password")
+
+try:
+    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USERNAME, NEO4J_PASSWORD))
+    print("[SYSTEM] Neo4j Driver Initialized Successfully.")
+except Exception as e:
+    print(f"[ERROR] Failed to initialize Neo4j: {e}")
+    driver = None
+
+# Ensure stdout handles UTF-8 (emojis in CrewAI logs)
+try:
+    sys.__stdout__.reconfigure(encoding='utf-8')
+except AttributeError:
+    pass
+
+class ConsoleInterceptor(io.StringIO):
+    def __init__(self):
+        super().__init__()
+        self.logs = deque(maxlen=200) # Keep last 200 lines
+    
+    def write(self, s):
+        super().write(s)
+        clean_s = s.strip()
+        if clean_s:
+            self.logs.append(clean_s)
+        sys.__stdout__.write(s)
+        sys.__stdout__.flush()
+
+# Instantiate and bind the interceptor globally
+live_console = ConsoleInterceptor()
+sys.stdout = live_console
+live_console.write("[SYSTEM] NTRO Core API Initialized.\n")
+live_console.write("[SYSTEM] Listening for intelligence payloads from scraper swarms...\n")
+
+app = FastAPI(title="CryptoIntel AI: Central Investigation Core")
+
+# Enable CORS so a frontend teammate can hit this from a browser over local Wi-Fi.
+# allow_origins=["*"] is fine for a hackathon demo on a local network; tighten
+# this to specific origins before deploying anywhere public.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class InvestigateRequest(BaseModel):
+    raw_text: str
+    source_url: str = "Unknown"
+
+
+@app.get("/")
+async def health_check():
+    return {"status": "CryptoIntel AI core is running"}
+
+@app.get("/api/v1/logs")
+async def get_logs():
+    return {"logs": list(live_console.logs)}
+
+def enrich_btc_address(address: str):
+    try:
+        res = requests.get(f"https://blockchain.info/rawaddr/{address}?limit=0", timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            return {
+                "tx_count": data.get("n_tx", 0),
+                "total_received": data.get("total_received", 0) / 100000000, # BTC
+                "final_balance": data.get("final_balance", 0) / 100000000, # BTC
+            }
+    except Exception:
+        pass
+    return None
+
+def inject_into_graph(intelligence_matrix):
+    """Inserts nodes and edges into Neo4j using Cypher MERGE commands."""
+    if not driver:
+        print("[WARN] Neo4j driver not initialized. Skipping graph injection.")
+        return
+        
+    if "error" in intelligence_matrix:
+        return
+        
+    nodes = intelligence_matrix.get("nodes", [])
+    edges = intelligence_matrix.get("edges", [])
+    
+    with driver.session() as session:
+        # Merge Nodes
+        for node in nodes:
+            node_id = node.get("id")
+            node_type = node.get("type", "Entity").replace(" ", "_").replace("-", "_").replace("`", "")
+            category = node.get("category", "Unknown")
+            crypto_type = node.get("crypto_type", "None")
+            source_url = node.get("source_url", "Unknown")
+            score = node.get("score", 0)
+            desc = node.get("desc", "")
+            timestamp = datetime.utcnow().isoformat()
+            
+            # PII Fields
+            phone = node.get("phone", "")
+            email = node.get("email", "")
+            bank_account = node.get("bank_account", "")
+            real_name = node.get("real_name", "")
+            address = node.get("address", "")
+            
+            # Blockchain Enrichment
+            tx_count = 0
+            final_balance = 0.0
+            total_received = 0.0
+            if crypto_type == "BTC":
+                enrichment = enrich_btc_address(node_id)
+                if enrichment:
+                    tx_count = enrichment["tx_count"]
+                    final_balance = enrichment["final_balance"]
+                    total_received = enrichment["total_received"]
+                    
+            # Using Cypher parameters to prevent injection
+            query = f"""
+            MERGE (n:`{node_type}` {{id: $id}})
+            ON CREATE SET n.timestamp = $timestamp, n.sightings_count = 1
+            ON MATCH SET n.sightings_count = coalesce(n.sightings_count, 1) + 1
+            SET n.category = $category, n.score = $score, n.desc = $desc, n.crypto_type = $crypto_type, n.source_url = $source_url, n.last_seen = $timestamp,
+                n.phone = $phone, n.email = $email, n.bank_account = $bank_account, n.real_name = $real_name, n.address = $address,
+                n.tx_count = $tx_count, n.final_balance = $final_balance, n.total_received = $total_received
+            """
+            session.run(query, id=node_id, category=category, score=score, desc=desc, crypto_type=crypto_type, source_url=source_url, timestamp=timestamp,
+                        phone=phone, email=email, bank_account=bank_account, real_name=real_name, address=address,
+                        tx_count=tx_count, final_balance=final_balance, total_received=total_received)
+            
+        # Merge Edges
+        for edge in edges:
+            from_id = edge.get("from")
+            to_id = edge.get("to")
+            rel = edge.get("relation", "LINKED_TO").upper().replace(" ", "_").replace("-", "_").replace("`", "")
+            
+            # Neo4j requires the relationship type to be statically defined in the query string,
+            # but we can pass the node IDs as parameters.
+            query = f"""
+            MATCH (a {{id: $from_id}})
+            MATCH (b {{id: $to_id}})
+            MERGE (a)-[r:`{rel}`]->(b)
+            """
+            session.run(query, from_id=from_id, to_id=to_id)
+            
+        # -------------------------------------------------------------
+        # Live Blockchain Forensics: Expand graph automatically
+        # -------------------------------------------------------------
+        for node in nodes:
+            node_id = node.get("id")
+            node_type = node.get("type", "")
+            crypto_type = node.get("crypto_type", "")
+            
+            if node_type == "Wallet" and crypto_type in ["BTC", "ETH"]:
+                txs = trace_wallet(node_id, crypto_type)
+                for tx in txs:
+                    sender = tx["from"]
+                    receiver = tx["to"]
+                    amount = tx["value"]
+                    tx_hash = tx["hash"]
+                    
+                    # Prevent tracing 0 value or missing txs
+                    if not sender or not receiver or amount <= 0:
+                        continue
+                        
+                    # Create the connected nodes
+                    for peer in [sender, receiver]:
+                        peer_query = f"""
+                        MERGE (n:Wallet {{id: $id}})
+                        ON CREATE SET n.timestamp = $timestamp, n.crypto_type = $crypto_type, n.category = 'Unknown', n.source_url = 'On-Chain Forensics'
+                        """
+                        session.run(peer_query, id=peer, timestamp=datetime.utcnow().isoformat(), crypto_type=crypto_type)
+                    
+                    # Create the TRANSACTED_WITH edge
+                    edge_query = f"""
+                    MATCH (a:Wallet {{id: $sender}})
+                    MATCH (b:Wallet {{id: $receiver}})
+                    MERGE (a)-[r:TRANSACTED_WITH {{tx_hash: $tx_hash}}]->(b)
+                    ON CREATE SET r.amount = $amount
+                    """
+                    session.run(edge_query, sender=sender, receiver=receiver, tx_hash=tx_hash, amount=amount)
+                    edges.append({"from": sender, "to": receiver, "relation": "TRANSACTED_WITH", "amount": amount})
+                    nodes.append({"id": sender, "type": "Wallet", "crypto_type": crypto_type})
+                    nodes.append({"id": receiver, "type": "Wallet", "crypto_type": crypto_type})
+                    
+    print(f"[NEO4J] Injected {len(nodes)} nodes and {len(edges)} edges into graph (including forensics).")
+
+
+@app.post("/api/v1/investigate")
+def analyze_scraped_data(payload: InvestigateRequest = Body(...)):
+    """
+    Main integration endpoint.
+    Accepts raw scraped text and returns the full intelligence matrix:
+    deterministic regex wallet hits + the 4-agent LLM analysis.
+    """
+    raw_text = payload.raw_text.strip()
+    
+    # Hard cap the text length to prevent LLM context window crashes
+    # especially for Manual Intel Drops where users might paste massive Wikipedia pages
+    if len(raw_text) > 4000:
+        raw_text = raw_text[:4000]
+        print(f"[API] Warning: Payload truncated from {len(payload.raw_text)} to 4000 characters.")
+        
+    source_url = payload.source_url
+
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="raw_text cannot be empty.")
+
+    # 1. Fast deterministic check (no LLM call, near-instant)
+    detected_wallets = extract_wallets_via_regex(text=raw_text)
+
+    # 2. Heavy 4-agent LLM swarm (returns an already-parsed dict, or an
+    #    {"error": ..., "raw_output": ...} dict if parsing failed)
+    intelligence_matrix = run_investigation_pipeline(raw_text=raw_text, source_url=source_url)
+
+    # 3. Inject the results directly into Neo4j
+    inject_into_graph(intelligence_matrix)
+
+    # 4. Inject the raw text into LanceDB Evidence Vault
+    if lancedb_client is not None and hf_embeddings is not None:
+        try:
+            content_hash = hashlib.sha256(raw_text.encode('utf-8')).hexdigest()
+            
+            agent_outputs = intelligence_matrix.get("agent_outputs", {})
+            combined_text = raw_text
+            if agent_outputs:
+                combined_text += "\n\n=== 🕵️‍♂️ AGENT TRACE LOGS ===\n"
+                combined_text += f"📍 Agent 1 (OSINT Analyst): {agent_outputs.get('osint', 'N/A')}\n\n"
+                combined_text += f"📍 Agent 2 (Risk Scorer): {agent_outputs.get('risk', 'N/A')}\n\n"
+                combined_text += f"📍 Agent 3 (Context Interpreter): {agent_outputs.get('context', 'N/A')}\n\n"
+                combined_text += f"📍 Agent 4 (Matrix Compiler): {agent_outputs.get('matrix', 'N/A')}"
+
+            vector = hf_embeddings.embed_query(combined_text)
+            
+            nodes = intelligence_matrix.get("nodes", [])
+            risk_score = max([int(n.get("score", 0)) for n in nodes]) if nodes else 0
+            
+            data = [{
+                "vector": vector, 
+                "text": combined_text, 
+                "source_url": source_url, 
+                "risk_score": risk_score,
+                "timestamp": datetime.utcnow().isoformat(),
+                "content_hash": content_hash
+            }]
+            if "scraped_evidence" not in lancedb_client.table_names():
+                lancedb_client.create_table("scraped_evidence", data=data)
+                print(f"[LanceDB] Created new table and injected 1 record.")
+            else:
+                tbl = lancedb_client.open_table("scraped_evidence")
+                # Deduplication check
+                # Note: Where clause support can vary by lancedb version, using safe fallback
+                all_hashes = [r.get("content_hash") for r in tbl.search().limit(100).to_list()]
+                if content_hash in all_hashes:
+                    print(f"[LanceDB] Duplicate evidence ignored (hash matched).")
+                else:
+                    tbl.add(data)
+                    print(f"[LanceDB] Injected 1 record into evidence vault.")
+        except Exception as e:
+            print(f"[LanceDB ERROR] {e}")
+
+    return {
+        "status": "ok",
+        "regex_detected_wallets": detected_wallets,
+        "intelligence_matrix": intelligence_matrix,
+    }
+
+
+@app.get("/api/v1/evidence")
+async def get_evidence():
+    """Returns the latest intercepted raw text from LanceDB."""
+    try:
+        if lancedb_client is None:
+            return {"evidence": [], "error": "LanceDB not initialized"}
+        
+        # Reverting to table_names() as list_tables() returns a Paged object in newer versions
+        if "scraped_evidence" not in lancedb_client.table_names():
+            return {"evidence": []}
+            
+        tbl = lancedb_client.open_table("scraped_evidence")
+        records = tbl.search().to_list()
+        
+        # Safe sorting and formatting
+        records.sort(key=lambda x: str(x.get("timestamp", "")), reverse=True)
+        records = records[:50]
+        
+        safe_records = []
+        for r in records:
+            safe_records.append({
+                "text": str(r.get("text", "")),
+                "source_url": str(r.get("source_url", "")),
+                "risk_score": int(r.get("risk_score", 0)) if str(r.get("risk_score")).isdigit() else r.get("risk_score"),
+                "timestamp": str(r.get("timestamp", ""))
+            })
+            
+        return {"evidence": safe_records}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"evidence": [], "error": str(e)}
+
+@app.get("/api/v1/evidence/search")
+async def search_evidence(q: str = ""):
+    """Semantic search over LanceDB evidence vault."""
+    try:
+        if lancedb_client is None or hf_embeddings is None:
+            return {"evidence": [], "error": "LanceDB/Embeddings not initialized"}
+        
+        if not q:
+            return await get_evidence()
+
+        if "scraped_evidence" not in lancedb_client.table_names():
+            return {"evidence": []}
+            
+        tbl = lancedb_client.open_table("scraped_evidence")
+        vector = hf_embeddings.embed_query(q)
+        records = tbl.search(vector).limit(20).to_list()
+        
+        safe_records = []
+        for r in records:
+            safe_records.append({
+                "text": str(r.get("text", "")),
+                "source_url": str(r.get("source_url", "")),
+                "risk_score": int(r.get("risk_score", 0)) if str(r.get("risk_score")).isdigit() else r.get("risk_score"),
+                "timestamp": str(r.get("timestamp", ""))
+            })
+            
+        return {"evidence": safe_records}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return {"evidence": [], "error": str(e)}
+
+
+@app.get("/api/v1/export/json")
+async def export_json(days: int = 30, category: str = "All Categories", search: str = ""):
+    """Exports nodes and edges from the graph as JSON, honoring filters."""
+    if not driver:
+        raise HTTPException(status_code=500, detail="Neo4j not connected.")
+    
+    with driver.session() as session:
+        # Build dynamic query
+        where_clauses = []
+        params = {}
+        
+        if days:
+            where_clauses.append("datetime(n.timestamp) >= datetime() - duration({days: $days})")
+            params["days"] = days
+            
+        if category and category != "All Categories":
+            where_clauses.append("n.category = $category")
+            params["category"] = category
+            
+        if search:
+            where_clauses.append("(toLower(n.id) CONTAINS toLower($search) OR toLower(n.desc) CONTAINS toLower($search))")
+            params["search"] = search
+            
+        where_str = " WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+        
+        nodes_query = f"MATCH (n) {where_str} RETURN labels(n) as labels, properties(n) as props"
+        nodes_res = session.run(nodes_query, **params)
+        nodes = [{"labels": record["labels"], "properties": record["props"]} for record in nodes_res]
+        
+        # Only fetch edges where both source and target are in the filtered nodes
+        node_ids = [n["properties"]["id"] for n in nodes]
+        if not node_ids:
+            edges = []
+        else:
+            edges_query = """
+            MATCH (a)-[r]->(b) 
+            WHERE a.id IN $node_ids AND b.id IN $node_ids 
+            RETURN a.id as source, type(r) as rel, b.id as target
+            """
+            edges_res = session.run(edges_query, node_ids=node_ids)
+            edges = [{"source": record["source"], "relation": record["rel"], "target": record["target"]} for record in edges_res]
+        
+    return {"nodes": nodes, "edges": edges}
+
+
+@app.get("/api/v1/export/csv")
+async def export_csv(days: int = 30, category: str = "All Categories", search: str = ""):
+    """Exports filtered nodes from the graph as a CSV file."""
+    if not driver:
+        raise HTTPException(status_code=500, detail="Neo4j not connected.")
+    
+    # Reuse json logic to get filtered nodes
+    data = await export_json(days, category, search)
+    nodes = data.get("nodes", [])
+    
+    # Flatten properties
+    flat_nodes = []
+    for n in nodes:
+        props = n.get("properties", {})
+        props["type"] = n.get("labels", ["Entity"])[0] if n.get("labels") else "Entity"
+        flat_nodes.append(props)
+        
+    # Generate CSV in memory
+    output = io.StringIO()
+    fieldnames = ["id", "type", "category", "score", "crypto_type", "phone", "email", "bank_account", "real_name", "address", "last_seen", "sightings_count", "source_url", "tx_count", "final_balance"]
+    writer = csv.DictWriter(output, fieldnames=fieldnames, extrasaction='ignore')
+    writer.writeheader()
+    for node in flat_nodes:
+        writer.writerow(node)
+        
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=cryptointel_export.csv"}
+    )
+
+
+@app.get("/api/v1/export/pdf")
+async def export_pdf(days: int = 30, category: str = "All Categories", search: str = ""):
+    """Exports a high-level PDF Intelligence Report."""
+    data = await export_json(days, category, search)
+    nodes = data.get("nodes", [])
+    
+    # Filter and sort by risk score
+    high_risk = sorted([n["properties"] for n in nodes if n.get("properties", {}).get("score", 0) > 0], key=lambda x: x.get("score", 0), reverse=True)[:15]
+    
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+    
+    # Header
+    c.setFont("Helvetica-Bold", 18)
+    c.setFillColor(colors.darkred)
+    c.drawString(50, height - 50, "CryptoIntel AI - High Priority Threat Report")
+    
+    c.setFont("Helvetica", 10)
+    c.setFillColor(colors.gray)
+    c.drawString(50, height - 70, f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC | Filters: {days} Days, {category}")
+    
+    y = height - 110
+    
+    if not high_risk:
+        c.setFont("Helvetica", 12)
+        c.setFillColor(colors.black)
+        c.drawString(50, y, "No intelligence targets found for the given criteria.")
+    else:
+        for i, node in enumerate(high_risk):
+            if y < 100:
+                c.showPage()
+                y = height - 60
+                
+            c.setFont("Helvetica-Bold", 11)
+            c.setFillColor(colors.black)
+            node_id = str(node.get("id", "Unknown"))
+            if len(node_id) > 75: node_id = node_id[:72] + "..."
+            c.drawString(50, y, f"{i+1}. {node.get('type', 'Entity')}: {node_id}")
+            
+            y -= 15
+            c.setFont("Helvetica", 9)
+            c.setFillColor(colors.red if node.get('score', 0) >= 70 else colors.black)
+            c.drawString(60, y, f"Threat Score: {node.get('score', 0)} | Category: {node.get('category', 'Unknown')}")
+            
+            y -= 15
+            c.setFillColor(colors.darkslategray)
+            desc = str(node.get('desc', 'No context available')).replace('\n', ' ')
+            if len(desc) > 100: desc = desc[:97] + "..."
+            c.drawString(60, y, f"Context: {desc}")
+            
+            # PII / Blockchain info
+            extras = []
+            if node.get("crypto_type"): extras.append(f"Crypto: {node.get('crypto_type')}")
+            if node.get("tx_count", 0) > 0: extras.append(f"Txs: {node.get('tx_count')} | Received: {node.get('total_received')} BTC")
+            if extras:
+                y -= 15
+                c.setFillColor(colors.gray)
+                c.drawString(60, y, " | ".join(extras))
+                
+            y -= 25
+            
+    c.save()
+    buffer.seek(0)
+    
+    return Response(
+        content=buffer.getvalue(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline; filename=CryptoIntel_Report.pdf"}
+    )
+
+
+@app.get("/api/v1/export/report")
+async def export_report():
+    """Generates an HTML Tactical Report for export."""
+    if not driver:
+        raise HTTPException(status_code=500, detail="Neo4j not connected.")
+    
+    with driver.session() as session:
+        # Fetch nodes
+        nodes_res = session.run("MATCH (n) RETURN n.id as id, labels(n)[0] as type, n.category as category, n.score as score, n.desc as desc")
+        nodes = [dict(record) for record in nodes_res]
+        
+        # Fetch edges
+        edges_res = session.run("MATCH (a)-[r]->(b) RETURN a.id as source, type(r) as rel, b.id as target")
+        edges = [dict(record) for record in edges_res]
+        
+    high_risk_count = sum(1 for n in nodes if (n.get("score") or 0) > 50 or n.get("category") in ["Narcotics", "Terror Financing"])
+    
+    node_rows = ""
+    for n in sorted(nodes, key=lambda x: x.get("score") or 0, reverse=True):
+        risk_class = "high-risk alert-bg" if ((n.get("score") or 0) > 50 or n.get("category") in ["Narcotics", "Terror Financing"]) else ""
+        node_rows += f"""
+        <tr class="{risk_class}">
+            <td>{n.get("id")}</td>
+            <td>{n.get("category")}</td>
+            <td>{n.get("score")}</td>
+            <td>{n.get("desc", "")}</td>
+        </tr>
+        """
+        
+    edge_rows = ""
+    for e in edges:
+        edge_rows += f"""
+        <tr>
+            <td>{e.get("source")}</td>
+            <td>{e.get("rel")}</td>
+            <td>{e.get("target")}</td>
+        </tr>
+        """
+        
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>CRYPTOINTEL TACTICAL REPORT</title>
+        <style>
+            body {{
+                font-family: 'Courier New', Courier, monospace;
+                background-color: #ffffff;
+                color: #000000;
+                margin: 40px;
+                font-size: 14px;
+            }}
+            h1 {{
+                font-size: 24px;
+                border-bottom: 2px solid #000;
+                padding-bottom: 10px;
+                margin-bottom: 20px;
+                text-transform: uppercase;
+            }}
+            .metadata {{
+                margin-bottom: 40px;
+                font-weight: bold;
+                line-height: 1.5;
+            }}
+            .section-title {{
+                font-size: 18px;
+                font-weight: bold;
+                margin-top: 40px;
+                margin-bottom: 10px;
+                text-transform: uppercase;
+            }}
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                margin-bottom: 40px;
+            }}
+            th, td {{
+                border: 1px solid #000;
+                padding: 8px;
+                text-align: left;
+            }}
+            th {{
+                background-color: #f0f0f0;
+            }}
+            .high-risk {{
+                color: red;
+                font-weight: bold;
+            }}
+            .alert-bg {{
+                background-color: #ffeaea;
+            }}
+        </style>
+    </head>
+    <body>
+        <h1>CRYPTOINTEL TACTICAL REPORT</h1>
+        <div class="metadata">
+            TIMESTAMP: {datetime.utcnow().isoformat() + 'Z'}<br>
+            NEO4J DB: CONNECTED<br>
+            STATUS: ACTIVE INTELLIGENCE MATRIX<br>
+            TOTAL NODES: {len(nodes)}<br>
+            HIGH RISK ALERTS: {high_risk_count}<br>
+        </div>
+
+        <div class="section-title">THREAT MATRIX</div>
+        <table>
+            <tr>
+                <th>ENTITY ID</th>
+                <th>CATEGORY</th>
+                <th>RISK SCORE</th>
+                <th>DESCRIPTION</th>
+            </tr>
+            {node_rows}
+        </table>
+
+        <div class="section-title">NETWORK CONNECTIONS</div>
+        <table>
+            <tr>
+                <th>SOURCE ENTITY</th>
+                <th>RELATIONSHIP</th>
+                <th>TARGET ENTITY</th>
+            </tr>
+            {edge_rows}
+        </table>
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html_content)
+
+
+@app.get("/api/v1/export/pdf")
+async def export_pdf():
+    """Generates a PDF Tactical Report for export."""
+    if not driver:
+        raise HTTPException(status_code=500, detail="Neo4j not connected.")
+    if not REPORTLAB_AVAILABLE:
+        raise HTTPException(status_code=500, detail="ReportLab not installed. Cannot generate PDF.")
+    
+    with driver.session() as session:
+        nodes_res = session.run("MATCH (n) RETURN n.id as id, n.category as category, n.score as score, n.desc as desc")
+        nodes = [dict(record) for record in nodes_res]
+        
+    high_risk_count = sum(1 for n in nodes if (n.get("score") or 0) > 50 or n.get("category") in ["Narcotics", "Terror Financing"])
+    
+    output = io.BytesIO()
+    c = canvas.Canvas(output, pagesize=letter)
+    width, height = letter
+    
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, height - 50, "CRYPTOINTEL TACTICAL REPORT")
+    
+    c.setFont("Helvetica", 10)
+    y = height - 80
+    c.drawString(50, y, f"TIMESTAMP: {datetime.utcnow().isoformat() + 'Z'}")
+    c.drawString(50, y - 15, f"TOTAL NODES: {len(nodes)}")
+    c.drawString(50, y - 30, f"HIGH RISK ALERTS: {high_risk_count}")
+    
+    y -= 70
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(50, y, "THREAT MATRIX (Top 50 by Score)")
+    
+    y -= 20
+    c.setFont("Helvetica", 8)
+    sorted_nodes = sorted(nodes, key=lambda x: x.get("score") or 0, reverse=True)[:50]
+    
+    for n in sorted_nodes:
+        if y < 50:
+            c.showPage()
+            y = height - 50
+            c.setFont("Helvetica", 8)
+        
+        score = n.get("score") or 0
+        node_str = f"[{score}] {n.get('category')} | {n.get('id')} | {n.get('desc', '')[:100]}..."
+        
+        if score > 50 or n.get("category") in ["Narcotics", "Terror Financing"]:
+            c.setFillColorRGB(0.8, 0, 0)
+        else:
+            c.setFillColorRGB(0, 0, 0)
+            
+        c.drawString(50, y, node_str)
+        y -= 15
+        
+    c.save()
+    
+    return Response(
+        content=output.getvalue(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=crypto_intelligence_export.pdf"}
+    )
+
+@app.delete("/api/v1/flush")
+def flush_data():
+    """Wipes all data from Neo4j and LanceDB. Danger zone."""
+    # 1. Neo4j
+    if driver:
+        with driver.session() as session:
+            session.run("MATCH (n) DETACH DELETE n")
+            
+    # 2. LanceDB
+    if lancedb_client:
+        tables = lancedb_client.table_names()
+        if "scraped_evidence" in tables:
+            lancedb_client.drop_table("scraped_evidence")
+            
+    return {"status": "success", "message": "All graph and vector data flushed."}
+
+@app.get("/api/v1/health")
+def health_check():
+    """Returns the live connection status of backend databases."""
+    neo4j_status = "Connected" if driver else "Disconnected"
+    lancedb_status = "Connected" if lancedb_client else "Disconnected"
+    return {
+        "neo4j": neo4j_status,
+        "lancedb": lancedb_status
+    }
+
+class TargetRequest(BaseModel):
+    url: str
+    type: str
+
+class AskRequest(BaseModel):
+    query: str
+
+@app.post("/api/v1/ask")
+def ask_ai(payload: AskRequest):
+    query = payload.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query cannot be empty.")
+        
+    try:
+        # 1. Search LanceDB for context
+        context_texts = []
+        if lancedb_client and hf_embeddings:
+            if "scraped_evidence" in lancedb_client.table_names():
+                tbl = lancedb_client.open_table("scraped_evidence")
+                vector = hf_embeddings.embed_query(query)
+                results = tbl.search(vector).limit(3).to_list()
+                for r in results:
+                    context_texts.append(str(r.get("text", "")))
+                    
+        context_str = "\n\n---\n\n".join(context_texts) if context_texts else "No specific evidence found in database."
+        
+        # 2. Call Groq
+        groq_api_key = os.environ.get("GROQ_ASK_AI_KEY")
+        if not groq_api_key:
+            return {"answer": "Groq API key not configured for Semantic Search. Missing GROQ_ASK_AI_KEY."}
+            
+        system_prompt = f"You are CryptoIntel AI. Answer the user's question based ONLY on the evidence below. Keep it concise, analytical, and tactical. If not in the evidence, say so.\n\nEVIDENCE:\n{context_str}"
+        headers = {
+            "Authorization": f"Bearer {groq_api_key}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query}
+            ],
+            "temperature": 0.1
+        }
+        
+        response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=data)
+        if response.status_code == 200:
+            answer = response.json()["choices"][0]["message"]["content"]
+            return {"answer": answer, "sources": len(context_texts)}
+        else:
+            return {"answer": f"Groq API Error: {response.text}", "sources": 0}
+            
+    except Exception as e:
+        return {"answer": f"Error occurred: {str(e)}", "sources": 0}
+
+@app.get("/api/v1/scraper/targets")
+def get_targets():
+    try:
+        with open("targets.json", "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return []
+
+@app.post("/api/v1/scraper/targets")
+def add_target(target: TargetRequest):
+    targets = get_targets()
+    targets.append(target.dict())
+    with open("targets.json", "w") as f:
+        json.dump(targets, f, indent=4)
+    return {"status": "success"}
+
+@app.delete("/api/v1/scraper/targets")
+def delete_target(url: str):
+    targets = get_targets()
+    targets = [t for t in targets if t["url"] != url]
+    with open("targets.json", "w") as f:
+        json.dump(targets, f, indent=4)
+    return {"status": "success"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+
+
+================================================================================
+File: .\README.md
+================================================================================
+
+# CryptoIntel AI — NTRO Core (PS-25228)
+
+Autonomous Cryptocurrency Address Collection & Categorization System.
+
+## Overview
+This system autonomously scrapes the surface and deep web for cryptocurrency addresses, associates them with PII (Personally Identifiable Information) and context, and uses a 4-agent LLM swarm (CrewAI) to extract, score, and categorize the threat. The data is stored in Neo4j (Graph) and LanceDB (Vector/Evidence), and visualized on a Next.js React Dashboard.
+
+## Features
+- **Deterministic Regex Extraction**: Detects BTC, ETH, XMR, TRX, LTC, DOGE, XRP, SOL, ZEC, DASH.
+- **Autonomous Scraper**: Configurable target lists (Clearweb & Tor), with auto-deduplication.
+- **4-Agent LLM Swarm**: OSINT Extraction → Risk Scoring → Context Summarization → Matrix Compilation.
+- **Dual-Database Architecture**: Neo4j for relationships (Graph) & LanceDB for raw evidence/semantic search (Vector).
+- **Interactive Dashboard**: Force-directed graph, Activity Timeline, Dossiers, Risk Alerts, and Semantic Search.
+- **Exporting**: CSV, JSON, auto-generated HTML Threat Bulletins, and PDF Reports.
+
+## Setup Instructions
+
+### 1. Prerequisites
+- Python 3.10+
+- Node.js 18+
+- [Neo4j Desktop](https://neo4j.com/download/) or Neo4j AuraDB
+
+### 2. Install Dependencies
+```bash
+# Python backend
+pip install -r requirements.txt
+
+# Node frontend
+cd frontend
+npm install
+```
+
+### 3. Environment Variables
+Create a `.env` file in the root directory:
+```env
+# Neo4j Database
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=password
+
+# LLM APIs (Gemini as primary, Groq as fallback)
+GEMINI_API_KEY=your_gemini_key
+GROQ_API_KEY_1=your_groq_key
+```
+
+### 4. Running the System
+
+Start the 3 core components in separate terminals:
+
+**Terminal 1 (Backend Core):**
+```bash
+python main.py
+```
+
+**Terminal 2 (Autonomous Scraper):**
+```bash
+python scraper.py
+```
+
+**Terminal 3 (Dashboard):**
+```bash
+cd frontend
+npm run dev
+```
+
+Open `http://localhost:3000` in your browser.
+
+## Architecture
+
+1. **Scraper (`scraper.py`)**: Fetches raw data from Telegram, Pastebin, .onion. Posts to `/api/v1/investigate`.
+2. **AI Swarm (`engine.py`)**: Parses the raw text. Outputs a strict JSON matrix of nodes and edges.
+3. **Core API (`main.py`)**: Receives the matrix, injects into Neo4j (Graph), calculates embeddings, and injects into LanceDB (Evidence Vault).
+4. **Dashboard (`frontend/`)**: Provides the analytical front end for querying, filtering, and exporting.
+
+
+================================================================================
+File: .\requirements.txt
+================================================================================
+
+crewai
+langchain-google-genai
+fastapi
+uvicorn
+python-dotenv
+pydantic
+neo4j
+requests
+requests[socks]
+lancedb
+langchain-huggingface
+sentence-transformers
+reportlab
+
+
+================================================================================
+File: .\scraper.py
+================================================================================
+
+import time
+import requests
+import hashlib
+import re
+import json
+import os
+import random
+import asyncio
+from playwright.async_api import async_playwright
+from playwright_stealth import Stealth
+
+# Your local FastAPI Core
+API_ENDPOINT = "http://localhost:8000/api/v1/investigate"
+
+async def scrape_target(page, url, seen_hashes, use_tor=False):
+    try:
+        print(f"\n[+] Scanning target: {url}")
+        
+        # Navigate to page, wait for domcontentloaded
+        await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        
+        # Give JS/Captchas a moment to settle
+        await page.wait_for_timeout(2000)
+        
+        scraped_text = await page.content()
+
+        # If Telegram, extract ONLY the message text to ignore dynamic view counts/timestamps
+        if "t.me" in url:
+            messages = re.findall(r'<div class="tgme_widget_message_text[^>]*>(.*?)</div>', scraped_text, re.DOTALL)
+            if messages:
+                # Get only the latest 3 messages to prevent blowing up the LLM token limit
+                recent_messages = messages[-3:]
+                # Strip internal HTML tags like <br> or <b>
+                clean_messages = [re.sub(r'<[^>]+>', ' ', m) for m in recent_messages]
+                scraped_text = " ".join(clean_messages)
+            else:
+                # Fallback if regex fails: strip all HTML and digits so timestamps/view counts don't change the hash
+                clean_html = re.sub(r'<[^>]+>', ' ', scraped_text)
+                stable_text = re.sub(r'\d+', '', clean_html) # Strip numbers
+                scraped_text = stable_text[-2000:]
+        else:
+            # For surface/dark web, cleanly extract visible innerText instead of raw HTML tags
+            try:
+                scraped_text = await page.evaluate("document.body.innerText")
+            except:
+                clean_html = re.sub(r'<[^>]+>', ' ', scraped_text)
+                scraped_text = clean_html
+
+        # Hard cap all extractions to prevent massive context window crashes in the LLM
+        if len(scraped_text) > 4000:
+            scraped_text = scraped_text[:4000]
+
+        # Deduplication
+        text_hash = hashlib.sha256(scraped_text.encode('utf-8')).hexdigest()
+        if text_hash in seen_hashes:
+            print(f"[*] No new changes detected on target. Bypassing AI engine.")
+            return
+        
+        seen_hashes.add(text_hash)
+        print(f"[*] Extracted {len(scraped_text)} characters. Sending to CryptoIntel Core...")
+        
+        # POST the live web data, passing the source_url
+        api_res = requests.post(API_ENDPOINT, json={
+            "raw_text": scraped_text,
+            "source_url": url
+        })
+        
+        if api_res.status_code == 200:
+            print("[✓] Intelligence Matrix updated successfully.")
+        else:
+            print(f"[!] API Error: {api_res.text}")
+            
+    except Exception as e:
+        if use_tor:
+            print(f"[!] Tor connection failed or timed out: {e}")
+        else:
+            print(f"[!] Target unreachable or rate-limited: {e}")
+
+async def run_autonomous_scraper():
+    import sys
+    sys.stdout.reconfigure(encoding='utf-8')
+    print("🕵️‍♂️ [SCRAPER] Initializing Playwright stealth autonomous web collection...")
+    seen_hashes = set()
+
+    async with async_playwright() as p:
+        # Launch two browsers: one standard, one Tor-proxied
+        print("[*] Launching stealth browsers...")
+        browser_standard = await p.chromium.launch(headless=True)
+        browser_tor = await p.chromium.launch(
+            headless=True,
+            proxy={"server": "socks5://127.0.0.1:9150"}
+        )
+
+        while True:
+            try:
+                with open("targets.json", "r") as f:
+                    targets = json.load(f)
+            except Exception:
+                targets = []
+
+            for target in targets:
+                url = target.get("url")
+                use_tor = "onion" in target.get("type", "").lower() or ".onion" in url
+                
+                if not url: continue
+
+                context = await (browser_tor if use_tor else browser_standard).new_context(
+                    viewport={"width": 1920, "height": 1080},
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" if "wikipedia.org" not in url else "CryptoIntel-OSINT-Bot/1.0"
+                )
+                page = await context.new_page()
+                
+                # Apply stealth ONLY to surface web non-wikipedia sites to defeat Cloudflare
+                if not use_tor and "wikipedia.org" not in url:
+                    await Stealth().apply_stealth_async(page)
+                
+                await scrape_target(page, url, seen_hashes, use_tor=use_tor)
+                await context.close()
+
+            print("[*] Sleeping 15 seconds to avoid rate limits...")
+            await asyncio.sleep(15)
+
+if __name__ == "__main__":
+    asyncio.run(run_autonomous_scraper())
+
+
+================================================================================
+File: .\targets.json
+================================================================================
+
+[
+    {
+        "url": "https://pastebin.com/raw/D4RwSSGM",
+        "type": "Surface Web"
+    },
+    {
+        "url": "https://pastebin.com/raw/sbHuTChQ",
+        "type": "Surface Web"
+    },
+    {
+        "url": "https://t.me/s/CryptoHackersDemo",
+        "type": "Telegram"
+    },
+    {
+        "url": "http://zqktlwiuavvvqqt4ybvgvi7tyo4hjl5xgfuvpdf6otjiycgwqbym2qad.onion/wiki/index.php/Main_Page",
+        "type": "Deep Web (.onion)"
+    },
+    {
+        "url": "https://en.wikipedia.org/wiki/Silk_Road_(marketplace)",
+        "type": "Surface Web"
+    }
+]
+
+================================================================================
+File: .\test2.py
+================================================================================
+
+import urllib.request
+import urllib.error
+
+try:
+    response = urllib.request.urlopen("http://127.0.0.1:8000/api/v1/evidence")
+    print("SUCCESS")
+    print(response.read().decode())
+except urllib.error.HTTPError as e:
+    print("HTTP ERROR:", e.code)
+    print(e.read().decode())
+except Exception as e:
+    print("OTHER ERROR:", e)
+
+
+================================================================================
+File: .\test3.py
+================================================================================
+
+import lancedb
+import pyarrow as pa
+try:
+    db = lancedb.connect("./test_vault")
+    schema = pa.schema([pa.field("vector", pa.list_(pa.float32(), 2)), pa.field("text", pa.string())])
+    tbl = db.create_table("test_table", schema=schema)
+    print("Table created.")
+    print("Has to_arrow?", hasattr(tbl, "to_arrow"))
+    try:
+        print(tbl.to_arrow().to_pylist())
+    except Exception as e:
+        print("ERROR ON to_arrow:", repr(e))
+except Exception as e:
+    print("OTHER ERROR:", repr(e))
+
+
+================================================================================
+File: .\test_endpoints.py
+================================================================================
+
+import urllib.request
+import json
+
+try:
+    print("LOGS:")
+    res_logs = urllib.request.urlopen("http://localhost:8000/api/v1/logs").read()
+    print(json.loads(res_logs))
+    
+    print("EVIDENCE:")
+    res_ev = urllib.request.urlopen("http://localhost:8000/api/v1/evidence").read()
+    print(json.loads(res_ev))
+except Exception as e:
+    print("ERROR:", e)
+
+
+================================================================================
+File: .\test_evidence.py
+================================================================================
+
+import urllib.request
+import urllib.error
+
+try:
+    response = urllib.request.urlopen("http://localhost:8000/api/v1/evidence")
+    print("SUCCESS")
+    print(response.read().decode())
+except urllib.error.HTTPError as e:
+    print("HTTP ERROR:", e.code)
+    print(e.read().decode())
+except Exception as e:
+    print("OTHER ERROR:", e)
+
+
+================================================================================
+File: .\frontend\.gitignore
+================================================================================
+
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+
+================================================================================
+File: .\frontend\AGENTS.md
+================================================================================
+
+<!-- BEGIN:nextjs-agent-rules -->
+# This is NOT the Next.js you know
+
+This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` before writing any code. Heed deprecation notices.
+<!-- END:nextjs-agent-rules -->
+
+
+================================================================================
+File: .\frontend\CLAUDE.md
+================================================================================
+
+@AGENTS.md
+
+
+================================================================================
+File: .\frontend\components.json
+================================================================================
+
+{
+  "$schema": "https://ui.shadcn.com/schema.json",
+  "style": "base-nova",
+  "rsc": true,
+  "tsx": true,
+  "tailwind": {
+    "config": "",
+    "css": "src/app/globals.css",
+    "baseColor": "neutral",
+    "cssVariables": true,
+    "prefix": ""
+  },
+  "iconLibrary": "lucide",
+  "rtl": false,
+  "aliases": {
+    "components": "@/components",
+    "utils": "@/lib/utils",
+    "ui": "@/components/ui",
+    "lib": "@/lib",
+    "hooks": "@/hooks"
+  },
+  "menuColor": "default",
+  "menuAccent": "subtle",
+  "registries": {}
+}
+
+
+================================================================================
+File: .\frontend\eslint.config.mjs
+================================================================================
+
+import { defineConfig, globalIgnores } from "eslint/config";
+import nextVitals from "eslint-config-next/core-web-vitals";
+import nextTs from "eslint-config-next/typescript";
+
+const eslintConfig = defineConfig([
+  ...nextVitals,
+  ...nextTs,
+  // Override default ignores of eslint-config-next.
+  globalIgnores([
+    // Default ignores of eslint-config-next:
+    ".next/**",
+    "out/**",
+    "build/**",
+    "next-env.d.ts",
+  ]),
+]);
+
+export default eslintConfig;
+
+
+================================================================================
+File: .\frontend\next-env.d.ts
+================================================================================
+
+/// <reference types="next" />
+/// <reference types="next/image-types/global" />
+import "./.next/dev/types/routes.d.ts";
+
+// NOTE: This file should not be edited
+// see https://nextjs.org/docs/app/api-reference/config/typescript for more information.
+
+
+================================================================================
+File: .\frontend\next.config.ts
+================================================================================
+
+import type { NextConfig } from "next";
+
+const nextConfig: NextConfig = {
+  async rewrites() {
+    return [
+      {
+        source: '/api/:path*',
+        destination: 'http://127.0.0.1:8000/api/:path*',
+      },
+    ];
+  },
+};
+
+export default nextConfig;
+
+
+================================================================================
+File: .\frontend\package.json
+================================================================================
+
+{
+  "name": "frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@base-ui/react": "^1.6.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.21.0",
+    "next": "16.2.9",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "react-force-graph-2d": "^1.29.1",
+    "shadcn": "^4.11.0",
+    "tailwind-merge": "^3.6.0",
+    "tailwindcss-animate": "^1.0.7",
+    "tw-animate-css": "^1.4.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.9",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}
+
+
+================================================================================
+File: .\frontend\postcss.config.mjs
+================================================================================
+
+const config = {
+  plugins: {
+    "@tailwindcss/postcss": {},
+  },
+};
+
+export default config;
+
+
+================================================================================
+File: .\frontend\README.md
+================================================================================
+
+This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+
+## Getting Started
+
+First, run the development server:
+
+```bash
+npm run dev
+# or
+yarn dev
+# or
+pnpm dev
+# or
+bun dev
+```
+
+Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+
+You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+
+This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+
+## Learn More
+
+To learn more about Next.js, take a look at the following resources:
+
+- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
+- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+
+You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+
+## Deploy on Vercel
+
+The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+
+Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+
+
+================================================================================
+File: .\frontend\tsconfig.json
+================================================================================
+
+{
+  "compilerOptions": {
+    "target": "ES2017",
+    "lib": ["dom", "dom.iterable", "esnext"],
+    "allowJs": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "jsx": "react-jsx",
+    "incremental": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    ".next/types/**/*.ts",
+    ".next/dev/types/**/*.ts",
+    "**/*.mts"
+  ],
+  "exclude": ["node_modules"]
+}
+
+
+================================================================================
+File: .\frontend\src\app\globals.css
+================================================================================
+
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme {
+  --font-sans: var(--font-space-grotesk);
+
+  --color-background: hsl(var(--background));
+  --color-foreground: hsl(var(--foreground));
+
+  --color-card: hsl(var(--card));
+  --color-card-foreground: hsl(var(--card-foreground));
+
+  --color-popover: hsl(var(--popover));
+  --color-popover-foreground: hsl(var(--popover-foreground));
+
+  --color-primary: hsl(var(--primary));
+  --color-primary-foreground: hsl(var(--primary-foreground));
+
+  --color-secondary: hsl(var(--secondary));
+  --color-secondary-foreground: hsl(var(--secondary-foreground));
+
+  --color-muted: hsl(var(--muted));
+  --color-muted-foreground: hsl(var(--muted-foreground));
+
+  --color-accent: hsl(var(--accent));
+  --color-accent-foreground: hsl(var(--accent-foreground));
+
+  --color-destructive: hsl(var(--destructive));
+  --color-destructive-foreground: hsl(var(--destructive-foreground));
+
+  --color-border: hsl(var(--border));
+  --color-input: hsl(var(--input));
+  --color-ring: hsl(var(--ring));
+
+  --color-chart-1: hsl(var(--chart-1));
+  --color-chart-2: hsl(var(--chart-2));
+  --color-chart-3: hsl(var(--chart-3));
+  --color-chart-4: hsl(var(--chart-4));
+  --color-chart-5: hsl(var(--chart-5));
+
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
+  
+  /* Animations */
+  @keyframes accordion-down {
+    from { height: 0 }
+    to { height: var(--radix-accordion-content-height) }
+  }
+  @keyframes accordion-up {
+    from { height: var(--radix-accordion-content-height) }
+    to { height: 0 }
+  }
+  --animate-accordion-down: accordion-down 0.2s ease-out;
+  --animate-accordion-up: accordion-up 0.2s ease-out;
+}
+
+/* Base Light Mode (Keeping it clean/neutral) */
+:root {
+  --background: 0 0% 100%;
+  --foreground: 240 10% 3.9%;
+  --card: 0 0% 100%;
+  --card-foreground: 240 10% 3.9%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 240 10% 3.9%;
+  --primary: 183 98% 48%; 
+  --primary-foreground: 0 0% 0%;
+  --secondary: 240 4.8% 95.9%;
+  --secondary-foreground: 240 5.9% 10%;
+  --muted: 240 4.8% 95.9%;
+  --muted-foreground: 240 3.8% 46.1%;
+  --accent: 285 85% 65%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 0 62.8% 30.6%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 240 5.9% 90%;
+  --input: 240 5.9% 90%;
+  --ring: 183 98% 48%;
+  --chart-1: 12 76% 61%;
+  --chart-2: 173 58% 39%;
+  --chart-3: 197 37% 24%;
+  --chart-4: 43 74% 66%;
+  --chart-5: 27 87% 67%;
+  --radius: 0.5rem;
+}
+
+/* Vibrant Dark Mode Vibe */
+.dark {
+  --background: 240 10% 3.9%;
+  --foreground: 0 0% 98%;
+  --card: 240 10% 6%;
+  --card-foreground: 0 0% 98%;
+  --popover: 240 10% 3.9%;
+  --popover-foreground: 0 0% 98%;
+  
+  /* Primary: Vibrant Neon Cyan/Teal */
+  --primary: 183 98% 48%;
+  --primary-foreground: 0 0% 0%;
+  
+  --secondary: 240 3.7% 15.9%;
+  --secondary-foreground: 0 0% 98%;
+  --muted: 240 3.7% 15.9%;
+  --muted-foreground: 240 5% 64.9%;
+  
+  /* Accent: Bright Purple/Pink */
+  --accent: 285 85% 65%;
+  --accent-foreground: 0 0% 100%;
+  
+  /* Destructive: Deep Red */
+  --destructive: 0 62.8% 30.6%;
+  --destructive-foreground: 0 0% 98%;
+  
+  --border: 240 3.7% 15.9%;
+  --input: 240 3.7% 15.9%;
+  --ring: 183 98% 48%;
+  
+  --chart-1: 183 98% 48%;
+  --chart-2: 285 85% 65%;
+  --chart-3: 240 10% 3.9%;
+  --chart-4: 0 62.8% 30.6%;
+  --chart-5: 0 0% 98%;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+================================================================================
+File: .\frontend\src\app\layout.tsx
+================================================================================
+
+import type { Metadata } from "next";
+import { Space_Grotesk } from "next/font/google";
+import "./globals.css";
+
+const spaceGrotesk = Space_Grotesk({
+  variable: "--font-space-grotesk",
+  subsets: ["latin"],
+});
+
+export const metadata: Metadata = {
+  title: "CryptoIntel Dashboard",
+  description: "Advanced intelligence tracking frontend.",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html
+      lang="en"
+      className={`dark ${spaceGrotesk.variable} h-full antialiased`}
+    >
+      <body className="min-h-full flex flex-col">{children}</body>
+    </html>
+  );
+}
+
+
+================================================================================
+File: .\frontend\src\app\page.tsx
+================================================================================
+
+"use client";
+
+import { useEffect, useState, useRef } from "react";
+import { Sidebar } from "@/components/Sidebar";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Activity, ShieldAlert, Cpu, Network, Download, Calendar, Filter, Radio, TerminalSquare, CheckCircle2, Search, ExternalLink, Mail, Phone, Link2, FileText, Minimize2, Maximize2, Expand, Shrink, AlertTriangle, X } from "lucide-react";
+import dynamic from "next/dynamic";
+import { DossierPanel } from "@/components/DossierPanel";
+import { LiveScraperPanel } from "@/components/LiveScraperPanel";
+import { RiskAlertsPanel } from "@/components/RiskAlertsPanel";
+import { AgentTracesPanel } from "@/components/AgentTracesPanel";
+import { ManualIntelDropPanel } from "@/components/ManualIntelDropPanel";
+import { SystemConfigPanel } from "@/components/SystemConfigPanel";
+import AskAIPanel from "@/components/AskAIPanel";
+
+const NetworkGraph = dynamic(() => import("@/components/NetworkGraph"), { ssr: false });
+
+function AgentMonitor({ isMinimized, setIsMinimized }: { isMinimized: boolean, setIsMinimized: (val: boolean) => void }) {
+  const [logs, setLogs] = useState<string[]>([]);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const fetchLogs = async () => {
+      try {
+        const res = await fetch("/api/v1/logs");
+        if (res.ok) {
+          const data = await res.json();
+          setLogs(data.logs || []);
+        }
+      } catch (e) {
+        // Silently ignore network errors if backend is down
+      }
+    };
+    
+    // Poll every 1 second
+    fetchLogs();
+    const timer = setInterval(fetchLogs, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Auto-scroll to bottom whenever new logs arrive
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [logs]);
+
+  return (
+    <Card className={`border-border/50 bg-black/80 flex flex-col transition-all duration-300 ${isMinimized ? 'h-[60px]' : 'h-[500px]'} overflow-hidden`}>
+      <CardHeader className="pb-3 border-b border-border/30 bg-black/90 flex flex-row items-center justify-between cursor-pointer hover:bg-black/70" onClick={() => setIsMinimized(!isMinimized)}>
+        <CardTitle className="text-sm font-mono text-primary flex items-center gap-2">
+           <TerminalSquare className="w-4 h-4 animate-pulse" /> LIVE SWARM TERMINAL
+        </CardTitle>
+        <button className="text-muted-foreground hover:text-foreground">
+          {isMinimized ? <Maximize2 className="w-4 h-4" /> : <Minimize2 className="w-4 h-4" />}
+        </button>
+      </CardHeader>
+      {!isMinimized && (
+        <CardContent className="p-4 font-mono text-[10px] sm:text-xs flex flex-col gap-1 overflow-y-auto h-[440px]" ref={scrollRef}>
+          {logs.length === 0 ? (
+            <div className="text-muted-foreground animate-pulse mt-2 ml-2">Awaiting intelligence payload...</div>
+          ) : (
+          logs.map((log, i) => {
+            // Apply some basic color coding based on standard CrewAI output
+            let textColor = "text-slate-300";
+            if (log.includes("[ERROR]") || log.includes("Error")) textColor = "text-red-500";
+            else if (log.includes("Agent Started")) textColor = "text-blue-400 mt-3 font-bold";
+            else if (log.includes("Agent Finished") || log.includes("I know the final answer") || log.includes("Final Answer:")) textColor = "text-green-400 mb-2 font-bold";
+            else if (log.includes("Thought:")) textColor = "text-purple-400";
+            else if (log.includes("Action:")) textColor = "text-yellow-400";
+            
+            return (
+              <div key={i} className={`whitespace-pre-wrap ${textColor}`}>
+                {log}
+              </div>
+            );
+          })
+        )}
+      </CardContent>
+      )}
+    </Card>
+  );
+}
+
+export default function Dashboard() {
+  const [activeTab, setActiveTab] = useState("Intelligence Graph");
+  const [nodes, setNodes] = useState<any[]>([]);
+  const [edges, setEdges] = useState<any[]>([]);
+  const [selectedNode, setSelectedNode] = useState<any | null>(null);
+  const [isGraphMinimized, setIsGraphMinimized] = useState(false);
+  const [isTerminalMinimized, setIsTerminalMinimized] = useState(false);
+  const [isGraphFullscreen, setIsGraphFullscreen] = useState(false);
+  const [activeToasts, setActiveToasts] = useState<any[]>([]);
+  const seenIds = useRef<Set<string>>(new Set());
+  const initialLoadDone = useRef(false);
+  
+  // Filters
+  const [daysFilter, setDaysFilter] = useState(7);
+  const [selectedCategory, setSelectedCategory] = useState("All Categories");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [recenterTrigger, setRecenterTrigger] = useState(0);
+
+  useEffect(() => {
+    const fetchData = async () => {
+      try {
+        const res = await fetch("/api/v1/export/json");
+        if (res.ok) {
+          const data = await res.json();
+          const allNodes = data.nodes || [];
+          setNodes(allNodes);
+          setEdges(data.edges || []);
+          
+          // Global High Risk Alert Logic
+          const highRisk = allNodes
+            .filter((n: any) => (n.properties?.score || 0) >= 70 || n.properties?.category === "Terror Financing")
+            .map((n: any) => n.properties);
+            
+          if (initialLoadDone.current) {
+            const newAlerts = highRisk.filter((a: any) => !seenIds.current.has(a.id));
+            if (newAlerts.length > 0) {
+              newAlerts.forEach((a: any) => {
+                const toastId = Math.random().toString(36).substring(7);
+                setActiveToasts(prev => [...prev, { ...a, toastId }]);
+                setTimeout(() => {
+                  setActiveToasts(prev => prev.filter(t => t.toastId !== toastId));
+                }, 8000);
+              });
+            }
+          }
+          
+          highRisk.forEach((a: any) => seenIds.current.add(a.id));
+          initialLoadDone.current = true;
+        }
+      } catch (err) {
+        console.error("Failed to fetch graph data", err);
+      }
+    };
+    
+    fetchData();
+    const interval = setInterval(fetchData, 5000); // Live poll every 5s
+    return () => clearInterval(interval);
+  }, []);
+
+  // Compute Ticker data
+  const [timeSinceLastExt, setTimeSinceLastExt] = useState<string>("Waiting...");
+  useEffect(() => {
+    const updateTicker = () => {
+      if (nodes.length === 0) return;
+      // find the latest timestamp
+      let latest = 0;
+      nodes.forEach(n => {
+        if (n.properties?.timestamp) {
+          const d = new Date(n.properties.timestamp).getTime();
+          if (d > latest) latest = d;
+        }
+      });
+      if (latest > 0) {
+        const seconds = Math.floor((Date.now() - latest) / 1000);
+        if (seconds < 60) setTimeSinceLastExt(`${seconds} seconds ago`);
+        else setTimeSinceLastExt(`${Math.floor(seconds / 60)} minutes ago`);
+      }
+    };
+    updateTicker();
+    const tickerInterval = setInterval(updateTicker, 1000);
+    return () => clearInterval(tickerInterval);
+  }, [nodes]);
+
+  // Filter nodes
+  const filteredNodes = nodes.filter(node => {
+    // 1. Timeline filter
+    const dateStr = node.properties?.last_seen || node.properties?.timestamp;
+    if (dateStr) {
+      const nodeDate = new Date(dateStr);
+      const cutoffDate = new Date();
+      cutoffDate.setDate(cutoffDate.getDate() - daysFilter);
+      if (nodeDate < cutoffDate) return false;
+    }
+    
+    // 2. Category filter
+    if (selectedCategory !== "All Categories") {
+      const cat = node.properties?.category || "Unknown";
+      if (cat !== selectedCategory) return false;
+    }
+
+    // 3. Search Filter
+    if (searchQuery.trim() !== "") {
+      const query = searchQuery.toLowerCase();
+      const idMatch = node.properties?.id?.toLowerCase().includes(query);
+      const descMatch = node.properties?.desc?.toLowerCase().includes(query);
+      const typeMatch = node.properties?.crypto_type?.toLowerCase().includes(query) || (node.labels && node.labels[0]?.toLowerCase().includes(query)) || node.properties?.type?.toLowerCase().includes(query);
+      if (!idMatch && !descMatch && !typeMatch) return false;
+    }
+
+    return true;
+  });
+
+  // Also filter edges where both source and target are in filteredNodes
+  const filteredNodeIds = new Set(filteredNodes.map(n => n.properties?.id));
+  const filteredEdges = edges.filter(e => filteredNodeIds.has(e.source) && filteredNodeIds.has(e.target));
+
+  return (
+    <div className="flex h-screen bg-background overflow-hidden selection:bg-primary/30">
+      {/* GLOBAL TOAST CONTAINER */}
+      <div className="fixed top-6 left-1/2 -translate-x-1/2 z-[200] flex flex-col items-center gap-3 pointer-events-none">
+        {activeToasts.map(toast => (
+          <div key={toast.toastId} className="pointer-events-auto w-[450px] bg-red-950/90 border-2 border-red-500 rounded-lg shadow-[0_0_30px_rgba(239,68,68,0.6)] p-4 animate-in slide-in-from-top-10 fade-in duration-500 relative overflow-hidden">
+             <div className="absolute top-0 left-0 w-full h-1 bg-red-500 animate-[pulse_1s_ease-in-out_infinite]" />
+             <button onClick={() => setActiveToasts(prev => prev.filter(t => t.toastId !== toast.toastId))} className="absolute top-2 right-2 text-red-300 hover:text-white">
+               <X className="w-4 h-4" />
+             </button>
+             <div className="flex items-start gap-3">
+                <AlertTriangle className="w-8 h-8 text-red-500 animate-pulse mt-1 shrink-0" />
+                <div>
+                   <h4 className="font-bold font-mono text-red-100 text-lg uppercase tracking-wider mb-1">High-Risk Entity Detected</h4>
+                   <p className="text-sm font-mono text-red-300 mb-2">Score: {toast.score} | Category: {toast.category || "Unknown"}</p>
+                   <p className="text-xs text-red-200/70 font-mono truncate max-w-[350px]">ID: {toast.id}</p>
+                </div>
+             </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Sidebar */}
+      <Sidebar activeTab={activeTab} onTabChange={setActiveTab} />
+      
+      <main className="flex-1 overflow-y-auto p-8 relative flex flex-col">
+        {activeTab === "Intelligence Graph" ? (
+          <>
+            {selectedNode && (
+               <DossierPanel 
+                 node={selectedNode.properties || selectedNode} 
+                 edges={filteredEdges} 
+                 onClose={() => setSelectedNode(null)} 
+               />
+            )}
+            <header className="mb-6 flex flex-col xl:flex-row xl:items-start justify-between gap-4 border-b border-border/50 pb-4">
+              <div>
+                <div className="flex items-center gap-3 mb-1">
+                  <h2 className="text-3xl font-bold tracking-tight">CRYPTOINTEL AI // NTRO CORE</h2>
+                  <Badge variant="outline" className="px-3 py-1 text-xs border-green-500/50 text-green-400 bg-green-500/10 uppercase tracking-widest flex items-center gap-1.5 shadow-[0_0_10px_rgba(34,197,94,0.2)]">
+                    <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
+                    Scraper: ACTIVE
+                  </Badge>
+                </div>
+                <div className="flex items-center text-sm text-muted-foreground gap-2">
+                  <Radio className="w-4 h-4 text-green-400 animate-pulse" />
+                  <span className="font-mono bg-black/30 px-2 py-0.5 rounded border border-border/50">
+                    Live Ticker // Last extraction: {timeSinceLastExt} - Target: Pastebin Asset Drop
+                  </span>
+                </div>
+              </div>
+              
+              <div className="flex gap-3 flex-wrap justify-end">
+                <a href={`/api/v1/export/csv?days=${daysFilter}&category=${encodeURIComponent(selectedCategory)}&search=${encodeURIComponent(searchQuery)}`} target="_blank" rel="noreferrer" className="flex items-center gap-2 px-4 py-2 font-medium text-xs rounded-md border border-primary/50 bg-primary/10 text-primary hover:bg-primary/20 transition-all shadow-[0_0_15px_rgba(16,185,129,0.15)]">
+                  <Download className="w-4 h-4" /> Data (CSV)
+                </a>
+                <a href="/api/v1/export/report" target="_blank" rel="noreferrer" className="flex items-center gap-2 px-4 py-2 font-medium text-xs rounded-md border border-accent/50 bg-accent/10 text-accent hover:bg-accent/20 transition-all shadow-[0_0_15px_rgba(6,182,212,0.15)]">
+                  <FileText className="w-4 h-4" /> Report (HTML)
+                </a>
+                <button onClick={() => window.open("/api/v1/export/pdf", "_blank")} className="flex items-center gap-2 px-4 py-2 font-medium text-xs rounded-md border border-destructive/50 bg-destructive/10 text-destructive hover:bg-destructive/20 transition-all shadow-[0_0_15px_rgba(239,68,68,0.15)]">
+                  <FileText className="w-4 h-4" /> Export PDF Report
+                </button>
+                <button onClick={() => window.open("/api/v1/export/report", "_blank")} className="flex items-center gap-2 px-4 py-2 font-medium text-xs rounded-md border border-purple-500/50 bg-purple-500/10 text-purple-400 hover:bg-purple-500/20 transition-all shadow-[0_0_15px_rgba(168,85,247,0.15)]">
+                  <Activity className="w-4 h-4" /> Generate Threat Bulletin
+                </button>
+              </div>
+            </header>
+
+            {/* KPI Stats Row */}
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-6">
+              <Card className="bg-card/40 border-border/50">
+                <CardContent className="p-4 flex flex-col justify-center">
+                  <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-1">Total Entities</div>
+                  <div className="text-2xl font-bold">{filteredNodes.length}</div>
+                </CardContent>
+              </Card>
+              <Card className="bg-card/40 border-border/50">
+                <CardContent className="p-4 flex flex-col justify-center">
+                  <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-1">High Risk Alerts</div>
+                  <div className="text-2xl font-bold text-destructive animate-pulse flex items-center gap-2">
+                    <ShieldAlert className="w-5 h-5" />
+                    {filteredNodes.filter(n => (n.properties?.score || 0) > 50).length}
+                  </div>
+                </CardContent>
+              </Card>
+              <Card className="bg-card/40 border-border/50">
+                <CardContent className="p-4 flex flex-col justify-center">
+                  <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-1">Unique Suspects</div>
+                  <div className="text-2xl font-bold text-primary">
+                    {filteredNodes.filter(n => n.properties?.type === "Suspect").length}
+                  </div>
+                </CardContent>
+              </Card>
+              <Card className="bg-card/40 border-border/50">
+                <CardContent className="p-4 flex flex-col justify-center">
+                  <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-1">Crypto Addresses</div>
+                  <div className="text-2xl font-bold text-green-400">
+                    {filteredNodes.filter(n => n.properties?.type === "Wallet").length}
+                  </div>
+                </CardContent>
+              </Card>
+              <Card className="bg-card/40 border-border/50">
+                <CardContent className="p-4 flex flex-col justify-center">
+                  <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-1">Connected Graph Edges</div>
+                  <div className="text-2xl font-bold text-accent">{filteredEdges.length}</div>
+                </CardContent>
+              </Card>
+              
+              {/* Timeline Heatmap */}
+              <Card className="bg-card/40 border-border/50">
+                <CardContent className="p-4 flex flex-col justify-center h-full">
+                  <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-2">Activity Heatmap (7 Days)</div>
+                  <div className="flex items-center gap-1 h-8">
+                    {[6, 5, 4, 3, 2, 1, 0].map(dayOffset => {
+                       const targetDate = new Date();
+                       targetDate.setDate(targetDate.getDate() - dayOffset);
+                       const dateString = targetDate.toISOString().split('T')[0];
+                       
+                       const count = filteredNodes.filter(n => {
+                          const ts = n.properties?.last_seen || n.properties?.timestamp;
+                          if (!ts) return false;
+                          return ts.startsWith(dateString);
+                       }).length;
+                       
+                       let intensity = "bg-secondary";
+                       if (count > 0 && count < 3) intensity = "bg-primary/40";
+                       else if (count >= 3 && count < 10) intensity = "bg-primary/70";
+                       else if (count >= 10) intensity = "bg-primary";
+                       
+                       return (
+                         <div key={dayOffset} className={`flex-1 h-full rounded-sm ${intensity} transition-all hover:ring-1 hover:ring-primary`} title={`${dateString}: ${count} entities`} />
+                       );
+                    })}
+                  </div>
+                </CardContent>
+              </Card>
+            </div>
+
+            {/* Filter Bar */}
+            <div className="mb-6 bg-card/40 border border-border/50 rounded-lg p-4 flex flex-col md:flex-row items-center gap-6">
+                
+                <div className="flex-1 w-full flex items-center gap-4">
+                  <Search className="text-muted-foreground w-5 h-5 shrink-0" />
+                  <div className="flex-1">
+                      <label className="text-sm font-medium mb-2 block">Global Search</label>
+                      <input 
+                        type="text" 
+                        placeholder="Search Wallet, Name, Phone, Email..." 
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        className="w-full bg-background border border-border/50 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-primary"
+                      />
+                  </div>
+                </div>
+
+                <div className="h-10 w-px bg-border hidden md:block"></div>
+
+                <div className="flex-1 w-full flex items-center gap-4">
+                  <Calendar className="text-muted-foreground w-5 h-5 shrink-0" />
+                  <div className="flex-1">
+                      <label className="text-sm font-medium mb-2 block">Timeline: Last {daysFilter} Days</label>
+                      <input 
+                          type="range" 
+                          min="1" max="30" 
+                          value={daysFilter} 
+                          onChange={(e) => setDaysFilter(parseInt(e.target.value))}
+                          className="w-full accent-primary cursor-pointer"
+                      />
+                  </div>
+                </div>
+                
+                <div className="h-10 w-px bg-border hidden md:block"></div>
+                
+                <div className="flex-1 w-full flex items-center gap-4">
+                  <Filter className="text-muted-foreground w-5 h-5 shrink-0" />
+                  <div className="flex-1">
+                      <label className="text-sm font-medium mb-2 block">Threat Category</label>
+                      <select 
+                        value={selectedCategory}
+                        onChange={(e) => setSelectedCategory(e.target.value)}
+                        className="w-full bg-background border border-border/50 rounded-md px-3 py-1.5 text-sm focus:outline-none focus:ring-1 focus:ring-primary"
+                      >
+                        <option>All Categories</option>
+                        <option>Narcotics</option>
+                        <option>Terror Financing</option>
+                        <option>Money Laundering</option>
+                        <option>Cybercrime</option>
+                        <option>Unknown</option>
+                      </select>
+                  </div>
+                </div>
+
+                <div className="h-10 w-px bg-border hidden xl:block"></div>
+                
+                <div className="flex flex-col gap-2 shrink-0 w-full xl:w-auto">
+                  <button onClick={() => { setSearchQuery(""); setDaysFilter(30); setSelectedCategory("All Categories"); }} className="px-4 py-1.5 w-full bg-secondary/50 hover:bg-secondary text-xs font-medium rounded-md border border-border transition-colors">
+                    Clear Filters
+                  </button>
+                  <button onClick={() => setRecenterTrigger(prev => prev + 1)} className="px-4 py-1.5 w-full bg-primary/10 hover:bg-primary/20 text-primary text-xs font-medium rounded-md border border-primary/30 transition-colors">
+                    Recenter Graph
+                  </button>
+                </div>
+            </div>
+
+            {/* Main Graph & Agent Monitor Split */}
+            <div className={`flex flex-col lg:flex-row gap-6 mb-6 ${isTerminalMinimized ? 'items-start' : ''}`}>
+               <div className={`transition-all duration-300 ${isTerminalMinimized ? 'lg:w-[300px]' : 'lg:w-1/3'} flex-shrink-0`}>
+                  <AgentMonitor isMinimized={isTerminalMinimized} setIsMinimized={setIsTerminalMinimized} />
+               </div>
+               <Card className={`border-border/50 flex flex-col overflow-hidden transition-all duration-300 ${isGraphFullscreen ? 'fixed inset-4 z-50 bg-black shadow-2xl rounded-xl h-[calc(100vh-2rem)] border-primary/50' : (isGraphMinimized ? 'bg-card/40 flex-1 h-[60px]' : 'bg-card/40 flex-1 h-[500px]')}`}>
+                 <CardHeader className="pb-3 border-b border-border/30 bg-black/20 flex flex-row items-center justify-between cursor-pointer hover:bg-black/30" onClick={(e) => {
+                   if ((e.target as HTMLElement).closest('.controls-btn')) return;
+                   if (!isGraphFullscreen) setIsGraphMinimized(!isGraphMinimized);
+                 }}>
+                   <CardTitle className="flex justify-between items-center text-lg w-full">
+                     <span className="flex items-center gap-2"><Network className="w-5 h-5 text-primary" /> INTERACTIVE NETWORK MAP</span>
+                     <div className="flex items-center gap-4">
+                       <Badge variant="outline" className="font-mono text-xs text-muted-foreground bg-background/50 hidden sm:flex">
+                         Neo4j Engine // Click Node for Dossier
+                       </Badge>
+                       <div className="flex items-center gap-2 controls-btn">
+                         <button onClick={(e) => { e.stopPropagation(); setIsGraphFullscreen(!isGraphFullscreen); if(isGraphMinimized) setIsGraphMinimized(false); }} className="text-muted-foreground hover:text-foreground bg-black/50 p-1.5 rounded-md hover:bg-black/80 transition-colors">
+                           {isGraphFullscreen ? <Shrink className="w-4 h-4" /> : <Expand className="w-4 h-4" />}
+                         </button>
+                         {!isGraphFullscreen && (
+                           <button onClick={(e) => { e.stopPropagation(); setIsGraphMinimized(!isGraphMinimized); }} className="text-muted-foreground hover:text-foreground bg-black/50 p-1.5 rounded-md hover:bg-black/80 transition-colors">
+                             {isGraphMinimized ? <Maximize2 className="w-4 h-4" /> : <Minimize2 className="w-4 h-4" />}
+                           </button>
+                         )}
+                       </div>
+                     </div>
+                   </CardTitle>
+                 </CardHeader>
+                 {!isGraphMinimized && (
+                   <CardContent className={`p-0 ${isGraphFullscreen ? 'flex-1 h-full' : 'h-[440px]'}`}>
+                     <div className="w-full h-full bg-black/40 overflow-hidden border border-border/50 relative">
+                       <NetworkGraph nodes={filteredNodes} edges={filteredEdges} onNodeClick={(node) => setSelectedNode(node)} recenterTrigger={recenterTrigger} />
+                     </div>
+                   </CardContent>
+                 )}
+               </Card>
+            </div>
+
+            {/* Investigation Timeline */}
+            <div className="mb-6 flex items-center justify-between px-4 py-3 bg-black/30 border border-border/50 rounded-lg text-xs font-mono text-muted-foreground">
+               <div className="flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-blue-500"></div>RAW SOURCE SCRAPED</div>
+               <div className="text-border">→</div>
+               <div className="flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-purple-500"></div>OSINT EXTRACTION</div>
+               <div className="text-border">→</div>
+               <div className="flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-orange-500"></div>RISK SCORED</div>
+               <div className="text-border">→</div>
+               <div className="flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-destructive"></div>FLAGGED</div>
+               <div className="text-border">→</div>
+               <div className="flex items-center gap-2"><div className="w-2 h-2 rounded-full bg-green-500"></div>STORED IN NEO4J</div>
+            </div>
+
+            {/* Live Intelligence Feed Table */}
+            <Card className="border-border/50 bg-card/40 flex flex-col min-h-[400px]">
+              <CardHeader className="pb-3 border-b border-border/30 bg-black/20">
+                <CardTitle className="text-lg flex items-center gap-2">LIVE INTELLIGENCE FEED & WALLET REGISTRY</CardTitle>
+              </CardHeader>
+              <CardContent className="flex-1 p-0 overflow-auto max-h-[500px]">
+                <Table>
+                  <TableHeader className="bg-black/40 sticky top-0 z-10">
+                    <TableRow className="border-border/50 hover:bg-transparent">
+                      <TableHead className="py-3 px-4">Wallet / Entity</TableHead>
+                      <TableHead className="py-3 px-4">Crypto Type</TableHead>
+                      <TableHead className="py-3 px-4">PII Linked</TableHead>
+                      <TableHead className="py-3 px-4">Source</TableHead>
+                      <TableHead className="py-3 px-4">Last Seen</TableHead>
+                      <TableHead className="py-3 px-4 text-right">Category & Score</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {filteredNodes.map((row, i) => {
+                      // Check for PII
+                      const desc = (row.properties?.desc || "").toLowerCase();
+                      const type = (row.properties?.type || "").toLowerCase();
+                      const hasPhone = desc.includes("phone") || desc.includes("call") || desc.includes("+") || type === "phone";
+                      const hasEmail = desc.includes("email") || desc.includes("@") || type === "email";
+                      const hasBank = desc.includes("bank") || desc.includes("fiat");
+                      
+                      return (
+                      <TableRow key={i} className="border-border/50 hover:bg-secondary/40 transition-colors cursor-pointer" onClick={() => setSelectedNode(row)}>
+                        <TableCell className="font-mono text-xs max-w-[200px] truncate px-4 py-3" title={row.properties?.id}>{row.properties?.id}</TableCell>
+                        <TableCell className="px-4 py-3">
+                          <Badge variant="outline" className={`text-xs whitespace-nowrap bg-blue-500/10 text-blue-400 border-blue-500/50`}>
+                            {row.properties?.crypto_type || (row.properties?.type === "Wallet" ? "Unknown" : "N/A")}
+                          </Badge>
+                        </TableCell>
+                        <TableCell className="px-4 py-3">
+                          <div className="flex items-center gap-2 text-muted-foreground">
+                            {hasPhone && <Phone className="w-4 h-4 text-orange-400" title="Phone Linked" />}
+                            {hasEmail && <Mail className="w-4 h-4 text-blue-400" title="Email Linked" />}
+                            {hasBank && <Activity className="w-4 h-4 text-green-400" title="Bank Linked" />}
+                            {(!hasPhone && !hasEmail && !hasBank) && <span className="text-xs">None</span>}
+                          </div>
+                        </TableCell>
+                        <TableCell className="px-4 py-3 text-xs text-muted-foreground max-w-[150px] truncate">
+                           {row.properties?.source_url && row.properties?.source_url !== "Unknown" ? (
+                             <a href={row.properties.source_url.startsWith('http') ? row.properties.source_url : `https://${row.properties.source_url}`} target="_blank" rel="noreferrer" className="flex items-center gap-1 hover:text-primary transition-colors">
+                               <ExternalLink className="w-3 h-3 flex-shrink-0" /> {(() => {
+                                 try {
+                                   return new URL(row.properties.source_url).hostname;
+                                 } catch {
+                                   return row.properties.source_url;
+                                 }
+                               })()}
+                             </a>
+                           ) : (
+                             "Unknown"
+                           )}
+                        </TableCell>
+                        <TableCell className="px-4 py-3 text-xs font-mono text-muted-foreground whitespace-nowrap">
+                          {row.properties?.last_seen ? new Date(row.properties.last_seen).toLocaleDateString() : (row.properties?.timestamp ? new Date(row.properties.timestamp).toLocaleDateString() : "N/A")}
+                        </TableCell>
+                        <TableCell className="text-right font-medium px-4 py-3">
+                          <div className="flex items-center justify-end gap-2">
+                            <Badge variant="outline" className={`text-[10px] uppercase tracking-wider ${getCategoryColor(row.properties?.category)}`}>
+                              {row.properties?.category || "Unknown"}
+                            </Badge>
+                            <span className={`${row.properties?.score > 50 ? 'text-red-400 font-bold' : ''}`}>
+                              {row.properties?.score > 50 && <ShieldAlert className="w-3 h-3 inline mr-1" />}{row.properties?.score || 0}
+                            </span>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    )})}
+                    {filteredNodes.length === 0 && (
+                        <TableRow>
+                            <TableCell colSpan={4} className="text-center text-muted-foreground py-12">
+                              No intelligence nodes match the current filter criteria.
+                            </TableCell>
+                        </TableRow>
+                    )}
+                  </TableBody>
+                </Table>
+              </CardContent>
+            </Card>
+          </>
+        ) : activeTab === "Evidence Vault" ? (
+          <LiveScraperPanel />
+        ) : activeTab === "Manual Intel Drop" ? (
+          <ManualIntelDropPanel />
+        ) : activeTab === "Ask AI Search" ? (
+          <AskAIPanel />
+        ) : activeTab === "Risk Alerts" ? (
+          <RiskAlertsPanel />
+        ) : activeTab === "Agent Traces" ? (
+          <AgentTracesPanel />
+        ) : activeTab === "System Config" ? (
+          <SystemConfigPanel />
+        ) : (
+          <div className="flex flex-col items-center justify-center h-full opacity-50">
+            <Cpu className="w-16 h-16 text-muted-foreground mb-4" />
+            <h2 className="text-2xl font-bold tracking-tight">Module Sandbox Offline</h2>
+            <p className="text-muted-foreground mt-2">The {activeTab} module is restricted for this terminal.</p>
+            <button onClick={() => setActiveTab("Intelligence Graph")} className="mt-6 px-4 py-2 bg-primary/20 text-primary rounded-md border border-primary/50 hover:bg-primary/30 transition-colors">
+              Return to Core Matrix
+            </button>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+function getCategoryColor(category?: string) {
+  switch (category) {
+    case "Narcotics": return "text-destructive border-destructive/50 bg-destructive/10";
+    case "Terror Financing": return "text-destructive border-destructive/50 bg-destructive/10";
+    case "Money Laundering": return "text-accent border-accent/50 bg-accent/10";
+    case "Cybercrime": return "text-primary border-primary/50 bg-primary/10";
+    default: return "text-muted-foreground border-border/50 bg-secondary/50";
+  }
+}
+
+
+================================================================================
+File: .\frontend\src\components\AgentTracesPanel.tsx
+================================================================================
+
+import { useEffect, useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { TerminalSquare, Cpu, Globe, Clock, ChevronRight, Search } from "lucide-react";
+
+export function AgentTracesPanel() {
+  const [evidence, setEvidence] = useState<any[]>([]);
+  const [selectedItem, setSelectedItem] = useState<any | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+
+  useEffect(() => {
+    const fetchEvidence = async () => {
+      try {
+        const res = await fetch("/api/v1/evidence");
+        if (res.ok) {
+          const data = await res.json();
+          // Filter to only items that have agent traces
+          const traces = (data.evidence || []).filter((e: any) => e.text && e.text.includes("=== 🕵️‍♂️ AGENT TRACE LOGS ==="));
+          setEvidence(traces);
+        }
+      } catch (e) {
+        console.error("Failed to fetch evidence");
+      }
+    };
+    fetchEvidence();
+    const timer = setInterval(fetchEvidence, 5000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const parseTraces = (fullText: string) => {
+    const parts = fullText.split("=== 🕵️‍♂️ AGENT TRACE LOGS ===");
+    return {
+      rawText: parts[0]?.trim() || "",
+      traces: parts[1]?.trim() || ""
+    };
+  };
+
+  return (
+    <div className="flex h-full gap-4">
+      {/* List */}
+      <Card className="w-[350px] border-border/50 bg-black/40 overflow-hidden flex flex-col shrink-0">
+        <CardHeader className="pb-3 border-b border-border/30 bg-primary/10">
+          <CardTitle className="text-sm font-mono text-primary flex flex-col gap-3">
+            <div className="flex items-center gap-2"><Cpu className="w-4 h-4" /> AI REASONING LOGS</div>
+            <div className="relative">
+              <Search className="w-4 h-4 absolute left-2 top-1/2 -translate-y-1/2 text-primary/50" />
+              <input 
+                type="text" 
+                placeholder="Search traces..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full bg-background border border-primary/20 rounded-md pl-8 pr-3 py-1.5 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+              />
+            </div>
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="p-0 overflow-y-auto flex-1 custom-scrollbar">
+          {evidence.length === 0 ? (
+            <div className="p-4 text-xs text-muted-foreground animate-pulse flex items-center justify-center h-20">Awaiting Agent Outputs...</div>
+          ) : (
+            <div className="divide-y divide-border/30">
+              {evidence.filter(item => item.text?.toLowerCase().includes(searchQuery.toLowerCase()) || item.source_url?.toLowerCase().includes(searchQuery.toLowerCase())).map((item, i) => (
+                <div 
+                  key={i} 
+                  className={`p-4 cursor-pointer transition-colors hover:bg-primary/10 ${selectedItem === item ? "bg-primary/20 border-l-2 border-primary" : ""}`}
+                  onClick={() => setSelectedItem(item)}
+                >
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-xs font-mono text-primary flex items-center gap-1">
+                      <TerminalSquare className="w-3 h-3" /> SWARM TRACE
+                    </span>
+                    <div className="flex items-center text-[10px] text-muted-foreground gap-1">
+                      <Clock className="w-3 h-3" />
+                      {new Date(item.timestamp).toLocaleTimeString()}
+                    </div>
+                  </div>
+                  <div className="text-xs text-foreground truncate font-medium flex items-center gap-1">
+                    <Globe className="w-3 h-3" /> {item.source_url}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Content Viewer */}
+      <Card className="flex-1 border-primary/30 bg-black/60 overflow-hidden flex flex-col shadow-[0_0_20px_rgba(6,182,212,0.15)]">
+        <CardHeader className="pb-3 border-b border-primary/20 bg-primary/5">
+          <CardTitle className="text-sm font-mono text-primary flex items-center gap-2">
+            <TerminalSquare className="w-4 h-4" /> MULTI-AGENT THOUGHT PROCESS
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="p-0 overflow-hidden flex-1 font-mono text-xs text-slate-300 flex flex-col">
+          {selectedItem ? (
+            <div className="flex flex-col h-full overflow-hidden">
+              <div className="p-4 bg-black/50 border-b border-border/50 text-[10px] text-muted-foreground h-32 shrink-0 overflow-y-auto custom-scrollbar">
+                <span className="text-primary/70 block mb-1">=== TARGET RAW INTEL ===</span>
+                {parseTraces(selectedItem.text).rawText}
+              </div>
+              <div className="p-6 flex-1 overflow-y-auto custom-scrollbar whitespace-pre-wrap leading-relaxed text-green-400/90 font-medium">
+                {parseTraces(selectedItem.text).traces}
+              </div>
+            </div>
+          ) : (
+            <div className="h-full flex items-center justify-center text-primary/40 flex-col gap-4">
+              <Cpu className="w-16 h-16 animate-pulse" />
+              <span className="text-sm tracking-widest uppercase">Select an investigation trace</span>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+
+================================================================================
+File: .\frontend\src\components\AskAIPanel.tsx
+================================================================================
+
+"use client";
+
+import React, { useState } from "react";
+import { Brain, Search, Send, Loader2, Database } from "lucide-react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+
+export default function AskAIPanel() {
+  const [query, setQuery] = useState("");
+  const [messages, setMessages] = useState<{role: 'user' | 'ai', content: string, sources?: number}[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  const handleAsk = async () => {
+    if (!query.trim()) return;
+    
+    setMessages(prev => [...prev, { role: 'user', content: query }]);
+    setLoading(true);
+    setQuery("");
+
+    try {
+      const res = await fetch("http://localhost:8000/api/v1/ask", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: query.trim() })
+      });
+      
+      const data = await res.json();
+      setMessages(prev => [...prev, { 
+        role: 'ai', 
+        content: data.answer || "Error connecting to AI.", 
+        sources: data.sources 
+      }]);
+    } catch (err) {
+      setMessages(prev => [...prev, { role: 'ai', content: "Failed to connect to backend server." }]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Card className="border-border/50 bg-card/40 flex flex-col h-[700px]">
+      <CardHeader className="pb-3 border-b border-border/30 bg-black/20">
+        <CardTitle className="flex justify-between items-center text-lg">
+          <span className="flex items-center gap-2"><Brain className="w-5 h-5 text-purple-500" /> SEMANTIC SEARCH (Ask AI)</span>
+          <Badge variant="outline" className="font-mono text-xs text-muted-foreground bg-background/50 flex gap-2">
+            <Database className="w-3 h-3 text-blue-500" /> LanceDB + Groq Llama-3
+          </Badge>
+        </CardTitle>
+      </CardHeader>
+      
+      <CardContent className="p-4 flex-1 flex flex-col gap-4 overflow-hidden relative">
+        <div className="flex-1 overflow-y-auto pr-2 flex flex-col gap-4 font-mono text-sm">
+          {messages.length === 0 && (
+            <div className="h-full flex flex-col items-center justify-center text-muted-foreground opacity-50 gap-4">
+              <Brain className="w-16 h-16" />
+              <p>Ask anything about the intercepted data.</p>
+              <div className="text-xs text-center max-w-sm">
+                "Are there any wallets linked to Terror Financing?"<br/>
+                "What is the contact email for ShadowBroker99?"
+              </div>
+            </div>
+          )}
+          
+          {messages.map((m, i) => (
+            <div key={i} className={`flex flex-col gap-1.5 ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
+              <div className={`text-[10px] uppercase tracking-widest text-muted-foreground flex gap-2 items-center`}>
+                {m.role === 'user' ? 'ANALYST QUERY' : 'CRYPTOINTEL AI'}
+                {m.sources !== undefined && m.sources > 0 && (
+                  <span className="text-blue-500">[{m.sources} SOURCES]</span>
+                )}
+              </div>
+              <div className={`p-3 rounded-md max-w-[85%] whitespace-pre-wrap ${
+                m.role === 'user' 
+                  ? 'bg-primary/20 border border-primary/30 text-primary-foreground' 
+                  : 'bg-black/40 border border-border/50 text-muted-foreground'
+              }`}>
+                {m.content}
+              </div>
+            </div>
+          ))}
+          {loading && (
+            <div className="flex flex-col gap-1.5 items-start">
+              <div className="text-[10px] uppercase tracking-widest text-muted-foreground">CRYPTOINTEL AI</div>
+              <div className="p-3 rounded-md bg-black/40 border border-border/50 text-muted-foreground flex items-center gap-2">
+                <Loader2 className="w-4 h-4 animate-spin text-purple-500" />
+                Querying LanceDB vectors & generating response...
+              </div>
+            </div>
+          )}
+        </div>
+        
+        <div className="mt-auto relative">
+          <input 
+            type="text" 
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && handleAsk()}
+            placeholder="Search the evidence vault..."
+            className="w-full bg-black/50 border border-border/50 rounded-md py-3 pl-10 pr-12 text-sm focus:outline-none focus:ring-1 focus:ring-primary font-mono"
+            disabled={loading}
+          />
+          <Search className="w-4 h-4 text-muted-foreground absolute left-3 top-3.5" />
+          <button 
+            onClick={handleAsk}
+            disabled={loading || !query.trim()}
+            className="absolute right-2 top-2 p-1.5 bg-primary/20 text-primary rounded hover:bg-primary/40 transition-colors disabled:opacity-50"
+          >
+            <Send className="w-4 h-4" />
+          </button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+
+================================================================================
+File: .\frontend\src\components\DossierPanel.tsx
+================================================================================
+
+import React from "react";
+import { X, ShieldAlert, AlertTriangle, Link as LinkIcon, Phone, Mail, Activity, User, MapPin, Database, Network } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+
+export function DossierPanel({ node, edges, onClose }: { node: any, edges: any[], onClose: () => void }) {
+  if (!node) return null;
+
+  const nodeEdges = edges.filter(e => e.source === node.id || e.target === node.id);
+
+  const getCategoryColor = (category?: string) => {
+    switch (category) {
+      case "Narcotics": return "text-destructive border-destructive/50 bg-destructive/10";
+      case "Terror Financing": return "text-destructive border-destructive/50 bg-destructive/10";
+      case "Money Laundering": return "text-accent border-accent/50 bg-accent/10";
+      case "Cybercrime": return "text-primary border-primary/50 bg-primary/10";
+      default: return "text-muted-foreground border-border/50 bg-secondary/50";
+    }
+  };
+
+  const isHighRisk = node.score && node.score > 50;
+
+  return (
+    <div className="absolute top-0 right-0 h-full w-80 bg-card border-l border-border/50 shadow-2xl flex flex-col z-20 animate-in slide-in-from-right duration-300">
+      <div className="p-4 border-b border-border/30 flex justify-between items-center bg-black/40">
+        <h3 className="font-bold text-lg flex items-center gap-2">
+          {isHighRisk && <ShieldAlert className="w-5 h-5 text-destructive" />}
+          Intelligence Dossier
+        </h3>
+        <button onClick={onClose} className="text-muted-foreground hover:text-foreground transition-colors">
+          <X className="w-5 h-5" />
+        </button>
+      </div>
+
+      <div className="p-4 flex-1 overflow-y-auto">
+        <div className="mb-6">
+          <label className="text-xs text-muted-foreground uppercase tracking-wider mb-1 block">Entity ID</label>
+          <div className="font-mono text-sm break-all">{node.id}</div>
+        </div>
+
+        <div className="mb-6 flex justify-between items-center">
+           <div>
+             <label className="text-xs text-muted-foreground uppercase tracking-wider mb-1 block">Category</label>
+             <Badge variant="outline" className={`${getCategoryColor(node.category)}`}>
+               {node.category || "Unknown"}
+             </Badge>
+           </div>
+           <div>
+             <label className="text-xs text-muted-foreground uppercase tracking-wider mb-1 block">Sightings</label>
+             <div className="font-mono text-sm">{node.sightings_count || 1}</div>
+           </div>
+           <div className="text-right">
+             <label className="text-xs text-muted-foreground uppercase tracking-wider mb-1 block">Threat Score</label>
+             <div className={`text-xl font-bold ${isHighRisk ? 'text-destructive' : 'text-primary'}`}>
+                {node.score || 0}/100
+             </div>
+           </div>
+        </div>
+
+        {node.desc && (
+            <div className="mb-6 bg-secondary/30 p-3 rounded-md border border-border/50">
+              <label className="text-xs text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1">
+                 <AlertTriangle className="w-3 h-3" /> AI Context Summary
+              </label>
+              <p className="text-sm leading-relaxed">{node.desc}</p>
+            </div>
+        )}
+
+        {(node.real_name || node.phone || node.email || node.bank_account || node.address) && (
+            <div className="mb-6">
+              <label className="text-xs text-muted-foreground uppercase tracking-wider mb-3 flex items-center gap-1">
+                 <User className="w-3 h-3" /> Personally Identifiable Information
+              </label>
+              <ul className="space-y-2">
+                {node.real_name && (
+                  <li className="flex items-center gap-2 text-sm">
+                    <User className="w-4 h-4 text-muted-foreground" /> <span className="font-medium text-foreground">{node.real_name}</span>
+                  </li>
+                )}
+                {node.phone && (
+                  <li className="flex items-center gap-2 text-sm">
+                    <Phone className="w-4 h-4 text-orange-400" /> <span className="font-medium text-foreground">{node.phone}</span>
+                  </li>
+                )}
+                {node.email && (
+                  <li className="flex items-center gap-2 text-sm">
+                    <Mail className="w-4 h-4 text-blue-400" /> <span className="font-medium text-foreground">{node.email}</span>
+                  </li>
+                )}
+                {node.address && (
+                  <li className="flex items-center gap-2 text-sm">
+                    <MapPin className="w-4 h-4 text-muted-foreground" /> <span className="font-medium text-foreground">{node.address}</span>
+                  </li>
+                )}
+                {node.bank_account && (
+                  <li className="flex items-center gap-2 text-sm">
+                    <Activity className="w-4 h-4 text-green-400" /> <span className="font-medium text-foreground">Fiat Acct: {node.bank_account}</span>
+                  </li>
+                )}
+              </ul>
+            </div>
+        )}
+
+        {node.tx_count !== undefined && node.tx_count > 0 && (
+            <div className="mb-6 bg-black/30 p-3 rounded-md border border-border/50">
+              <label className="text-xs text-muted-foreground uppercase tracking-wider mb-2 flex items-center gap-1">
+                 <Database className="w-3 h-3" /> Blockchain Intelligence
+              </label>
+              <div className="grid grid-cols-2 gap-3 text-sm">
+                <div>
+                  <span className="text-muted-foreground block text-xs">Tx Count</span>
+                  <span className="font-mono">{node.tx_count}</span>
+                </div>
+                <div>
+                  <span className="text-muted-foreground block text-xs">Final Balance</span>
+                  <span className="font-mono">{node.final_balance?.toFixed(4)} BTC</span>
+                </div>
+                <div className="col-span-2">
+                  <span className="text-muted-foreground block text-xs">Total Received</span>
+                  <span className="font-mono">{node.total_received?.toFixed(4)} BTC</span>
+                </div>
+              </div>
+            </div>
+        )}
+
+        {node.tx_count !== undefined && (
+            <div className="mb-6 bg-primary/10 p-3 rounded-md border border-primary/30">
+              <label className="text-xs text-primary uppercase tracking-wider mb-2 flex items-center gap-1">
+                 <Network className="w-3 h-3" /> Blockchain Forensics (Simulated API)
+              </label>
+              <div className="grid grid-cols-2 gap-4 mt-3">
+                <div>
+                  <div className="text-[10px] text-muted-foreground uppercase">Transaction Count</div>
+                  <div className="font-mono text-sm">{node.tx_count}</div>
+                </div>
+                <div>
+                  <div className="text-[10px] text-muted-foreground uppercase">Final Balance</div>
+                  <div className="font-mono text-sm">{node.final_balance}</div>
+                </div>
+                <div className="col-span-2">
+                  <div className="text-[10px] text-muted-foreground uppercase">Total Received</div>
+                  <div className="font-mono text-sm text-green-400">{node.total_received}</div>
+                </div>
+              </div>
+            </div>
+        )}
+
+        <div>
+          <label className="text-xs text-muted-foreground uppercase tracking-wider mb-3 flex items-center gap-1">
+             <LinkIcon className="w-3 h-3" /> Known Relationships ({nodeEdges.length})
+          </label>
+          {nodeEdges.length === 0 ? (
+             <p className="text-sm text-muted-foreground italic">No known connections.</p>
+          ) : (
+            <ul className="space-y-3">
+              {nodeEdges.map((e, i) => {
+                 const isSource = e.source === node.id || (e.source?.id && e.source.id === node.id);
+                 const otherNodeId = isSource ? (e.target?.id || e.target) : (e.source?.id || e.source);
+                 return (
+                     <li key={i} className={`text-sm p-2 rounded border ${e.relation === 'TRANSACTED_WITH' ? 'bg-green-950/20 border-green-500/30' : 'bg-black/20 border-border/30'}`}>
+                        <span className={`text-xs uppercase tracking-wider block mb-1 ${e.relation === 'TRANSACTED_WITH' ? 'text-green-400 font-bold' : 'text-muted-foreground'}`}>
+                          {isSource ? "OUTGOING" : "INCOMING"} • {e.relation} {e.amount ? `(Value: ${e.amount})` : ''}
+                        </span>
+                        <span className="font-mono text-xs break-all text-primary/80">{otherNodeId}</span>
+                     </li>
+                 )
+              })}
+            </ul>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+================================================================================
+File: .\frontend\src\components\LiveScraperPanel.tsx
+================================================================================
+
+import { useEffect, useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { ShieldAlert, Globe, Clock, FileText, Search, Play, CheckCircle2, Loader2, AlertCircle } from "lucide-react";
+
+export function LiveScraperPanel() {
+  const [evidence, setEvidence] = useState<any[]>([]);
+  const [selectedItem, setSelectedItem] = useState<any | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [isSearching, setIsSearching] = useState(false);
+  
+  const [reanalyzeStatus, setReanalyzeStatus] = useState<{type: "idle"|"loading"|"success"|"error", msg: string}>({type: "idle", msg: ""});
+
+  const fetchEvidence = async (query = "") => {
+    try {
+      if (query) setIsSearching(true);
+      const url = query ? `/api/v1/evidence/search?q=${encodeURIComponent(query)}` : "/api/v1/evidence";
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        setEvidence(data.evidence || []);
+      }
+    } catch (e) {
+      console.error("Failed to fetch evidence");
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchEvidence(searchQuery);
+    if (!searchQuery) {
+      const timer = setInterval(() => fetchEvidence(), 5000);
+      return () => clearInterval(timer);
+    }
+  }, [searchQuery]);
+
+  const handleReanalyze = async () => {
+    if (!selectedItem) return;
+    setReanalyzeStatus({ type: "loading", msg: "Processing..." });
+    try {
+      const rawText = selectedItem.text.split("=== 🕵️‍♂️ AGENT TRACE LOGS ===")[0].trim();
+      const res = await fetch("/api/v1/investigate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ raw_text: rawText, source_url: selectedItem.source_url })
+      });
+      if (res.ok) {
+        setReanalyzeStatus({ type: "success", msg: "Successfully Re-analyzed!" });
+        setTimeout(() => setReanalyzeStatus({ type: "idle", msg: "" }), 3000);
+      } else {
+        throw new Error("Failed");
+      }
+    } catch (e) {
+      setReanalyzeStatus({ type: "error", msg: "Error during analysis." });
+    }
+  };
+
+  const getRiskColor = (score: number) => {
+    if (score >= 80) return "bg-red-500/20 text-red-500 border-red-500/50";
+    if (score >= 50) return "bg-orange-500/20 text-orange-500 border-orange-500/50";
+    return "bg-green-500/20 text-green-500 border-green-500/50";
+  };
+
+  return (
+    <div className="flex h-full gap-4">
+      {/* Index List */}
+      <Card className="w-[350px] border-border/50 bg-black/40 overflow-hidden flex flex-col shrink-0">
+        <CardHeader className="pb-3 border-b border-border/30 bg-secondary/20">
+          <CardTitle className="text-sm font-mono text-primary flex flex-col gap-3">
+            <div className="flex items-center gap-2"><Globe className="w-4 h-4" /> EVIDENCE VAULT INDEX</div>
+            <div className="relative">
+              <Search className="w-4 h-4 absolute left-2 top-1/2 -translate-y-1/2 text-muted-foreground" />
+              <input 
+                type="text" 
+                placeholder="Semantic Search Vault..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full bg-background border border-border/50 rounded-md pl-8 pr-3 py-1.5 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+              />
+              {isSearching && <Loader2 className="w-3 h-3 absolute right-2 top-1/2 -translate-y-1/2 text-primary animate-spin" />}
+            </div>
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="p-0 overflow-y-auto flex-1 custom-scrollbar">
+          {evidence.length === 0 ? (
+            <div className="p-4 text-xs text-muted-foreground animate-pulse flex items-center justify-center h-20">Awaiting data injections...</div>
+          ) : (
+            <div className="divide-y divide-border/30">
+              {evidence.map((item, i) => (
+                <div 
+                  key={i} 
+                  className={`p-4 cursor-pointer transition-colors hover:bg-secondary/30 ${selectedItem === item ? "bg-secondary/50 border-l-2 border-primary" : ""}`}
+                  onClick={() => setSelectedItem(item)}
+                >
+                  <div className="flex items-center justify-between mb-2">
+                    <Badge variant="outline" className={`text-[10px] ${getRiskColor(item.risk_score)}`}>
+                      <ShieldAlert className="w-3 h-3 mr-1" /> RISK: {item.risk_score}
+                    </Badge>
+                    <div className="flex items-center text-[10px] text-muted-foreground gap-1">
+                      <Clock className="w-3 h-3" />
+                      {new Date(item.timestamp).toLocaleTimeString()}
+                    </div>
+                  </div>
+                  <div className="text-xs text-foreground truncate font-medium">{item.source_url}</div>
+                  <div className="text-[10px] text-muted-foreground truncate mt-1.5 opacity-80">{item.text.split("=== 🕵️‍♂️ AGENT TRACE LOGS ===")[0].trim()}</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Content Viewer */}
+      <Card className="flex-1 border-border/50 bg-black/60 overflow-hidden flex flex-col">
+        <CardHeader className="pb-3 border-b border-border/30 bg-secondary/20">
+          <CardTitle className="text-sm font-mono text-primary flex items-center gap-2">
+            <FileText className="w-4 h-4" /> RAW INTERCEPTED TEXT
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="p-6 overflow-y-auto flex-1 flex flex-col font-mono text-xs text-slate-300 whitespace-pre-wrap leading-relaxed custom-scrollbar selection:bg-primary/30">
+          {selectedItem ? (
+            <div className="flex flex-col h-full">
+              <div className="mb-4 flex items-center justify-between gap-2 text-muted-foreground bg-black/40 p-3 rounded-md border border-border/50 shadow-inner shrink-0">
+                <div className="flex items-center gap-2"><Globe className="w-4 h-4 text-primary" /> <span className="break-all font-medium text-foreground">{selectedItem.source_url}</span></div>
+                
+                <button 
+                  onClick={handleReanalyze}
+                  disabled={reanalyzeStatus.type === "loading"}
+                  className="flex items-center gap-1.5 px-3 py-1 bg-primary/20 hover:bg-primary/30 text-primary border border-primary/50 rounded transition-colors disabled:opacity-50 font-sans"
+                >
+                  {reanalyzeStatus.type === "loading" ? <Loader2 className="w-3 h-3 animate-spin" /> : 
+                   reanalyzeStatus.type === "success" ? <CheckCircle2 className="w-3 h-3 text-green-400" /> :
+                   reanalyzeStatus.type === "error" ? <AlertCircle className="w-3 h-3 text-red-400" /> :
+                   <Play className="w-3 h-3" />}
+                  {reanalyzeStatus.msg || "Re-Analyze"}
+                </button>
+              </div>
+              <div className="bg-secondary/10 p-4 rounded-md border border-border/20 shadow-sm leading-6 flex-1 overflow-y-auto">
+                {(() => {
+                  const raw = selectedItem.text.split("=== 🕵️‍♂️ AGENT TRACE LOGS ===")[0].trim();
+                  // simple highlight of crypto addresses (heuristic for demo)
+                  const parts = raw.split(/(\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b|\bbc1[a-zA-HJ-NP-Z0-9]{25,39}\b|\b0x[a-fA-F0-9]{40}\b|\b4[0-9AB][1-9A-HJ-NP-Za-km-z]{93}\b|\bT[A-Za-z1-9]{33}\b)/g);
+                  return parts.map((part: string, i: number) => {
+                    if (part.match(/^([13][a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-zA-HJ-NP-Z0-9]{25,39}|0x[a-fA-F0-9]{40}|4[0-9AB][1-9A-HJ-NP-Za-km-z]{93}|T[A-Za-z1-9]{33})$/)) {
+                      return <span key={i} className="bg-blue-500/20 text-blue-400 px-1 py-0.5 rounded font-bold border border-blue-500/30">{part}</span>;
+                    }
+                    return <span key={i}>{part}</span>;
+                  });
+                })()}
+              </div>
+              {selectedItem.text.includes("=== 🕵️‍♂️ AGENT TRACE LOGS ===") && (
+                <div className="mt-4 pt-4 border-t border-border/50 shrink-0">
+                  <div className="text-muted-foreground font-bold mb-2">Attached Trace Logs:</div>
+                  <div className="bg-black/50 p-3 rounded text-[10px] text-muted-foreground max-h-32 overflow-y-auto">
+                    {selectedItem.text.split("=== 🕵️‍♂️ AGENT TRACE LOGS ===")[1].trim()}
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="h-full flex items-center justify-center text-muted-foreground opacity-40 flex-col gap-4">
+              <FileText className="w-16 h-16" />
+              <span className="text-sm tracking-widest uppercase">Select an item to view raw evidence</span>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+
+================================================================================
+File: .\frontend\src\components\ManualIntelDropPanel.tsx
+================================================================================
+
+import React, { useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { UploadCloud, Play, CheckCircle2, Loader2, AlertCircle } from "lucide-react";
+
+export function ManualIntelDropPanel() {
+  const [url, setUrl] = useState("");
+  const [rawText, setRawText] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [status, setStatus] = useState<{ type: "idle" | "success" | "error", message: string }>({ type: "idle", message: "" });
+
+  const handleAnalyze = async () => {
+    if (!rawText.trim()) {
+      setStatus({ type: "error", message: "Raw text is required for manual analysis." });
+      return;
+    }
+
+    setLoading(true);
+    setStatus({ type: "idle", message: "Analyzing..." });
+
+    try {
+      const res = await fetch("/api/v1/investigate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          raw_text: rawText,
+          source_url: url || "Manual Entry"
+        })
+      });
+
+      if (!res.ok) {
+        throw new Error(`API returned ${res.status}`);
+      }
+      
+      setStatus({ type: "success", message: "Intelligence matrix successfully generated and injected." });
+      setRawText("");
+      setUrl("");
+    } catch (err: any) {
+      setStatus({ type: "error", message: err.message || "Failed to process intelligence." });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="w-full h-full overflow-y-auto max-w-4xl mx-auto flex flex-col gap-6 pt-4 pb-12">
+      <div>
+        <h2 className="text-2xl font-bold tracking-tight mb-2">Manual Intel Drop</h2>
+        <p className="text-muted-foreground text-sm">
+          Submit raw textual intercepts or custom URLs directly into the AI parsing swarm.
+        </p>
+      </div>
+
+      <Card className="border-border/50 bg-card/40">
+        <CardHeader className="border-b border-border/30 bg-black/20">
+          <CardTitle className="text-lg flex items-center gap-2">
+            <UploadCloud className="w-5 h-5 text-primary" /> Data Submission Form
+          </CardTitle>
+          <CardDescription>Paste raw text and provide an optional source URL.</CardDescription>
+        </CardHeader>
+        <CardContent className="p-6 flex flex-col gap-4">
+          
+          <div>
+            <label className="text-sm font-medium mb-1 block">Source URL (Optional)</label>
+            <input 
+              type="text" 
+              placeholder="e.g. https://pastebin.com/raw/XYZ..." 
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              className="w-full bg-background border border-border/50 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-primary"
+            />
+          </div>
+
+          <div>
+            <label className="text-sm font-medium mb-1 block">Raw Intercept Text <span className="text-destructive">*</span></label>
+            <textarea 
+              rows={6}
+              placeholder="Paste raw text here containing suspected cryptocurrency wallets, aliases, etc..." 
+              value={rawText}
+              onChange={(e) => setRawText(e.target.value)}
+              className="w-full bg-background border border-border/50 rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-primary font-mono overflow-y-auto"
+            />
+          </div>
+
+          {status.type !== "idle" && (
+            <div className={`p-3 rounded-md border flex items-start gap-2 text-sm ${
+              status.type === "error" ? "bg-destructive/10 border-destructive/50 text-red-400" : "bg-green-500/10 border-green-500/50 text-green-400"
+            }`}>
+              {status.type === "error" ? <AlertCircle className="w-4 h-4 mt-0.5" /> : <CheckCircle2 className="w-4 h-4 mt-0.5" />}
+              <div>{status.message}</div>
+            </div>
+          )}
+
+          <div className="flex justify-end pt-2 border-t border-border/30">
+            <button 
+              onClick={handleAnalyze} 
+              disabled={loading || !rawText.trim()}
+              className="flex items-center gap-2 px-6 py-2 bg-primary/20 text-primary font-medium rounded-md border border-primary/50 hover:bg-primary/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Play className="w-4 h-4" />}
+              {loading ? "Swarm Processing..." : "Execute Analysis"}
+            </button>
+          </div>
+
+        </CardContent>
+      </Card>
+      
+      <div className="text-xs text-muted-foreground p-4 bg-black/20 rounded border border-border/30">
+        <p className="font-bold mb-1">How it works:</p>
+        <p>1. The payload is sent to the local FastAPI core.</p>
+        <p>2. The deterministic regex engine will instantly flag wallets.</p>
+        <p>3. The 4-agent LLM swarm will structure the entities, calculate risk, and summarize context.</p>
+        <p>4. The payload will be indexed in Neo4j and LanceDB.</p>
+        <p className="mt-2 text-primary font-mono">Tip: Keep an eye on the Agent Traces panel for real-time logs.</p>
+      </div>
+    </div>
+  );
+}
+
+
+================================================================================
+File: .\frontend\src\components\NetworkGraph.tsx
+================================================================================
+
+"use client";
+
+import React, { useRef, useEffect, useState } from "react";
+import ForceGraph2D from "react-force-graph-2d";
+import { useTheme } from "next-themes";
+import { Minimize2, Maximize2, List } from "lucide-react";
+
+export default function NetworkGraph({ nodes, edges, onNodeClick, recenterTrigger }: { nodes: any[], edges: any[], onNodeClick?: (node: any) => void, recenterTrigger?: number }) {
+  const fgRef = useRef<any>();
+  const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [isLegendOpen, setIsLegendOpen] = useState(true);
+
+  // Resize observer to make graph responsive to the container
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const observer = new ResizeObserver((entries) => {
+      const { width, height } = entries[0].contentRect;
+      setDimensions({ width, height });
+    });
+    observer.observe(containerRef.current);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (fgRef.current && recenterTrigger > 0) {
+      // Guaranteed safe recenter that never calculates a NaN bounding box
+      fgRef.current.centerAt(0, 0, 400);
+      fgRef.current.zoom(1.2, 400);
+    }
+  }, [recenterTrigger]);
+
+  // Format nodes and edges for the graph
+  // react-force-graph modifies these objects (adds x, y, vx, vy), so we clone them
+  const graphData = React.useMemo(() => {
+    const safeLinks: any[] = [];
+    const adj = new Map<string, any[]>();
+    
+    nodes.forEach(n => adj.set(n.properties.id, []));
+    edges.forEach(e => {
+      const src = e.source?.id || e.source;
+      if (!adj.has(src)) adj.set(src, []);
+      adj.get(src)!.push(e);
+    });
+
+    const visited = new Set<string>();
+    const recStack = new Set<string>();
+
+    const dfs = (nodeId: string) => {
+      visited.add(nodeId);
+      recStack.add(nodeId);
+
+      const outEdges = adj.get(nodeId) || [];
+      for (const edge of outEdges) {
+        const tgt = edge.target?.id || edge.target;
+        if (!recStack.has(tgt)) {
+          safeLinks.push({
+            source: edge.source,
+            target: edge.target,
+            relation: edge.relation,
+            ...edge
+          });
+          if (!visited.has(tgt)) {
+            dfs(tgt);
+          }
+        }
+      }
+      recStack.delete(nodeId);
+    };
+
+    nodes.forEach(n => {
+      const id = n.properties.id;
+      if (!visited.has(id)) dfs(id);
+    });
+
+    return {
+      nodes: nodes.map(n => ({ ...n.properties, type: n.labels ? n.labels[0] : "Unknown", originalId: n.properties.id })),
+      links: safeLinks
+    };
+  }, [nodes, edges]);
+
+  // But wait, the nodes need an 'id' property. `properties.id` is what we have.
+  // The edges need 'source' and 'target' which map to node 'id's.
+
+  return (
+    <div ref={containerRef} className="w-full h-full relative" style={{ minHeight: '400px' }}>
+      <ForceGraph2D
+        ref={fgRef}
+        width={dimensions.width}
+        height={dimensions.height}
+        graphData={graphData}
+        nodeId="id"
+        dagMode="lr"
+        dagLevelDistance={80}
+        onNodeClick={onNodeClick}
+        nodeRelSize={6}
+        nodeVal={(node: any) => Math.max(4, (node.score || 10) / 10)}
+        linkColor={(link: any) => link.relation === 'TRANSACTED_WITH' ? 'rgba(34, 197, 94, 0.6)' : 'rgba(100, 116, 139, 0.4)'}
+        linkDirectionalParticles={(link: any) => link.relation === 'TRANSACTED_WITH' ? 5 : 2}
+        linkDirectionalParticleWidth={(link: any) => link.relation === 'TRANSACTED_WITH' ? 3 : 1.5}
+        linkDirectionalParticleSpeed={(link: any) => link.relation === 'TRANSACTED_WITH' ? 0.02 : 0.01}
+        linkDirectionalParticleColor={(link: any) => link.relation === 'TRANSACTED_WITH' ? '#22c55e' : undefined}
+        linkCurvature={0.2}
+        backgroundColor="transparent"
+        linkCanvasObjectMode={() => 'after'}
+        linkCanvasObject={(link: any, ctx, globalScale) => {
+          const start = link.source;
+          const end = link.target;
+          if (typeof start !== 'object' || typeof end !== 'object') return;
+
+          const label = link.relation || '';
+          if (globalScale > 2 && label) {
+            const MAX_FONT_SIZE = 4 / globalScale;
+            const textPos = {
+              x: start.x + (end.x - start.x) / 2,
+              y: start.y + (end.y - start.y) / 2
+            };
+            const relLink = { x: end.x - start.x, y: end.y - start.y };
+            let textAngle = Math.atan2(relLink.y, relLink.x);
+            if (textAngle > Math.PI / 2) textAngle = -(Math.PI - textAngle);
+            if (textAngle < -Math.PI / 2) textAngle = -(-Math.PI - textAngle);
+
+            ctx.save();
+            ctx.translate(textPos.x, textPos.y);
+            ctx.rotate(textAngle);
+            ctx.font = `${MAX_FONT_SIZE * 3}px Sans-Serif`;
+            const textWidth = ctx.measureText(label).width;
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+            ctx.fillRect(-textWidth / 2 - 1, -MAX_FONT_SIZE * 1.5, textWidth + 2, MAX_FONT_SIZE * 3);
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+            ctx.fillText(label, 0, 0);
+            ctx.restore();
+          }
+        }}
+        nodeCanvasObject={(node: any, ctx, globalScale) => {
+          const label = node.id;
+          const fontSize = 12 / globalScale;
+          const radius = Math.max(4, (node.score || 10) / 10);
+          
+          let color = '#64748b'; // default muted
+          if (node.category === 'Narcotics' || node.category === 'Terror Financing') color = '#ef4444';
+          else if (node.category === 'Money Laundering') color = '#06b6d4';
+          else if (node.category === 'Cybercrime') color = '#10b981';
+
+          // Draw Glow
+          ctx.shadowColor = color;
+          ctx.shadowBlur = 10;
+          
+          ctx.beginPath();
+          if (node.type === "Wallet") {
+            // Draw Node Circle for Wallets
+            ctx.arc(node.x, node.y, radius, 0, 2 * Math.PI, false);
+          } else {
+            // Draw Diamond for Suspects / Others
+            ctx.moveTo(node.x, node.y - radius);
+            ctx.lineTo(node.x + radius, node.y);
+            ctx.lineTo(node.x, node.y + radius);
+            ctx.lineTo(node.x - radius, node.y);
+            ctx.closePath();
+          }
+          ctx.fillStyle = color;
+          ctx.fill();
+          
+          // Reset shadow for text
+          ctx.shadowBlur = 0;
+
+          // Draw Label if zoomed in enough
+          if (globalScale > 1.5) {
+            ctx.font = `${fontSize}px Sans-Serif`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'top';
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+            ctx.fillText(label.length > 15 ? label.substring(0, 15) + '...' : label, node.x, node.y + radius + 2);
+          }
+        }}
+        onEngineStop={() => {
+          if (fgRef.current) {
+            // zoomToFit is too buggy on sparse graphs, use absolute positioning
+            fgRef.current.centerAt(0, 0, 400);
+            fgRef.current.zoom(1.2, 400);
+          }
+        }}
+      />
+
+      <div className="absolute bottom-4 right-4 flex flex-col items-end gap-2 pointer-events-auto">
+        {!isLegendOpen ? (
+          <button 
+            onClick={() => setIsLegendOpen(true)} 
+            className="bg-black/60 border border-border/50 p-2 rounded-md backdrop-blur-sm hover:text-primary transition-colors text-muted-foreground cursor-pointer shadow-lg"
+            title="Show Legend"
+          >
+            <List className="w-4 h-4" />
+          </button>
+        ) : (
+          <div className="bg-black/60 border border-border/50 p-3 rounded-md backdrop-blur-sm flex gap-6 relative shadow-lg pr-10">
+            <button 
+              onClick={() => setIsLegendOpen(false)}
+              className="absolute top-2 right-2 text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+              title="Minimize Legend"
+            >
+              <Minimize2 className="w-4 h-4" />
+            </button>
+            <div>
+              <div className="text-xs font-bold text-muted-foreground uppercase tracking-widest mb-2">Category Legend</div>
+              <div className="flex flex-col gap-1.5 text-xs">
+                <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-[#ef4444] shadow-[0_0_8px_#ef4444]" /> Narcotics / Terror</div>
+                <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-[#06b6d4] shadow-[0_0_8px_#06b6d4]" /> Money Laundering</div>
+                <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-[#10b981] shadow-[0_0_8px_#10b981]" /> Cybercrime</div>
+                <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full bg-[#64748b] shadow-[0_0_8px_#64748b]" /> Unknown / Uncategorized</div>
+              </div>
+            </div>
+            <div>
+              <div className="text-xs font-bold text-muted-foreground uppercase tracking-widest mb-2">Shape Legend</div>
+              <div className="flex flex-col gap-1.5 text-xs">
+                <div className="flex items-center gap-2"><div className="w-3 h-3 rounded-full border border-white" /> Crypto Wallet</div>
+                <div className="flex items-center gap-2"><div className="w-3 h-3 rotate-45 border border-white" /> Suspect Entity</div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+================================================================================
+File: .\frontend\src\components\RiskAlertsPanel.tsx
+================================================================================
+
+import { useEffect, useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { ShieldAlert, Globe, Clock, FileText, AlertTriangle } from "lucide-react";
+
+export function RiskAlertsPanel() {
+  const [alerts, setAlerts] = useState<any[]>([]);
+
+  useEffect(() => {
+    const fetchEvidence = async () => {
+      try {
+        const res = await fetch("/api/v1/export/json");
+        if (res.ok) {
+          const data = await res.json();
+          const allNodes = data.nodes || [];
+          
+          const highRisk = allNodes
+            .filter((n: any) => (n.properties?.score || 0) >= 50 || n.properties?.category === "Narcotics" || n.properties?.category === "Terror Financing")
+            .map((n: any) => n.properties);
+            
+          setAlerts(highRisk);
+        }
+      } catch (e) {
+        console.error("Failed to fetch evidence");
+      }
+    };
+    fetchEvidence();
+    const timer = setInterval(fetchEvidence, 5000);
+    return () => clearInterval(timer);
+  }, []);
+
+  return (
+    <div className="flex h-full flex-col gap-4">
+      <Card className="border-red-500/30 bg-red-950/10 flex-1 overflow-hidden flex flex-col">
+        <CardHeader className="pb-3 border-b border-red-500/20 bg-red-900/20">
+          <CardTitle className="text-sm font-mono text-red-500 flex items-center gap-2">
+            <AlertTriangle className="w-5 h-5 animate-pulse" /> HIGH PRIORITY THREAT ALERTS
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="p-6 overflow-y-auto flex-1 custom-scrollbar">
+          {alerts.length === 0 ? (
+            <div className="h-full flex items-center justify-center flex-col gap-4 opacity-50">
+              <ShieldAlert className="w-16 h-16 text-muted-foreground" />
+              <span className="text-muted-foreground uppercase tracking-widest text-sm">No Active High-Risk Threats Detected</span>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-4">
+              {alerts.map((alert, i) => (
+                <div key={i} className="bg-black/50 border border-red-500/30 p-4 rounded-lg flex flex-col gap-3 relative overflow-hidden group hover:border-red-500/50 transition-colors">
+                  <div className="absolute top-0 left-0 w-1 h-full bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.8)]" />
+                  <div className="flex justify-between items-center pl-3">
+                    <Badge className="bg-red-500 hover:bg-red-600 text-white font-mono flex items-center gap-1 text-xs px-2 py-0.5 shadow-[0_0_10px_rgba(239,68,68,0.5)]">
+                      <AlertTriangle className="w-3 h-3" /> THREAT SCORE: {alert.score || 0}
+                    </Badge>
+                    <span className="text-xs text-muted-foreground flex items-center gap-1 font-mono">
+                      <Clock className="w-3 h-3" /> {alert.last_seen ? new Date(alert.last_seen).toLocaleString() : (alert.timestamp ? new Date(alert.timestamp).toLocaleString() : "Unknown")}
+                    </span>
+                  </div>
+                  <div className="pl-3 flex flex-col gap-2">
+                    <div className="text-sm font-medium text-red-200 flex items-center gap-2 font-mono">
+                      {alert.type === "Wallet" ? "WALLET:" : "SUSPECT:"} {alert.id}
+                    </div>
+                    <div className="text-xs font-medium text-red-300/80 flex items-center gap-2">
+                      <Globe className="w-4 h-4 text-red-400" /> {alert.source_url}
+                    </div>
+                    <div className="bg-red-950/30 p-3 rounded text-xs font-mono text-red-100 border border-red-500/20 whitespace-pre-wrap leading-relaxed shadow-inner">
+                      {alert.desc || "No context available."}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+
+================================================================================
+File: .\frontend\src\components\Sidebar.tsx
+================================================================================
+
+import { useState } from "react";
+import { 
+  Activity, 
+  Database, 
+  Network, 
+  ShieldAlert, 
+  Settings,
+  TerminalSquare,
+  FileText,
+  Brain,
+  ChevronLeft,
+  Menu
+} from "lucide-react";
+
+export function Sidebar({ activeTab = "Intelligence Graph", onTabChange = () => {} }: { activeTab?: string, onTabChange?: (tab: string) => void }) {
+  const [isCollapsed, setIsCollapsed] = useState(false);
+  
+  return (
+    <div className={`${isCollapsed ? 'w-20' : 'w-64'} transition-all duration-300 border-r border-border bg-card/30 flex flex-col h-screen sticky top-0`}>
+      <div className={`p-6 flex items-center ${isCollapsed ? 'justify-center' : 'justify-between'}`}>
+        {!isCollapsed && (
+          <div>
+            <h1 className="text-xl font-bold tracking-tighter text-primary flex items-center gap-2">
+              <img src="/logo.png" alt="CryptoIntel Logo" className="w-8 h-8 rounded-md shadow-sm shadow-primary/20" />
+              CryptoIntel
+            </h1>
+            <p className="text-xs text-muted-foreground mt-1 tracking-widest uppercase">Autonomous Core</p>
+          </div>
+        )}
+        <button onClick={() => setIsCollapsed(!isCollapsed)} className="text-muted-foreground hover:text-foreground">
+          {isCollapsed ? <Menu className="w-5 h-5" /> : <ChevronLeft className="w-5 h-5" />}
+        </button>
+      </div>
+      
+      <nav className="flex-1 px-4 space-y-1 mt-4">
+        <NavItem isCollapsed={isCollapsed} icon={<Network className="w-4 h-4" />} label="Intelligence Graph" active={activeTab === "Intelligence Graph"} onClick={() => onTabChange("Intelligence Graph")} />
+        <NavItem isCollapsed={isCollapsed} icon={<Database className="w-4 h-4" />} label="Evidence Vault" active={activeTab === "Evidence Vault"} onClick={() => onTabChange("Evidence Vault")} />
+        <NavItem isCollapsed={isCollapsed} icon={<FileText className="w-4 h-4" />} label="Manual Intel Drop" active={activeTab === "Manual Intel Drop"} onClick={() => onTabChange("Manual Intel Drop")} />
+        <NavItem isCollapsed={isCollapsed} icon={<Brain className="w-4 h-4" />} label="Ask AI Search" active={activeTab === "Ask AI Search"} onClick={() => onTabChange("Ask AI Search")} />
+        <NavItem isCollapsed={isCollapsed} icon={<ShieldAlert className="w-4 h-4" />} label="Risk Alerts" active={activeTab === "Risk Alerts"} onClick={() => onTabChange("Risk Alerts")} />
+        <NavItem isCollapsed={isCollapsed} icon={<TerminalSquare className="w-4 h-4" />} label="Agent Traces" active={activeTab === "Agent Traces"} onClick={() => onTabChange("Agent Traces")} />
+      </nav>
+
+      <div className="p-4 border-t border-border mt-auto">
+        <NavItem isCollapsed={isCollapsed} icon={<Settings className="w-4 h-4" />} label="System Config" active={activeTab === "System Config"} onClick={() => onTabChange("System Config")} />
+        {!isCollapsed && (
+          <div className="mt-4 px-3 text-xs text-muted-foreground flex items-center justify-between">
+            <span>Swarm Status:</span>
+            <span className="flex items-center gap-1.5 text-primary">
+              <span className="w-2 h-2 rounded-full bg-primary animate-pulse" />
+              Online
+            </span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function NavItem({ icon, label, active = false, onClick, isCollapsed = false }: { icon: React.ReactNode, label: string, active?: boolean, onClick?: () => void, isCollapsed?: boolean }) {
+  return (
+    <button
+      onClick={onClick}
+      title={isCollapsed ? label : undefined}
+      className={`w-full flex items-center ${isCollapsed ? 'justify-center' : 'gap-3'} px-3 py-2.5 rounded-md transition-colors text-sm font-medium ${
+        active 
+          ? "bg-primary/10 text-primary border border-primary/20" 
+          : "text-muted-foreground hover:text-foreground hover:bg-secondary/50 border border-transparent"
+      }`}
+    >
+      {icon}
+      {!isCollapsed && <span>{label}</span>}
+    </button>
+  );
+}
+
+
+================================================================================
+File: .\frontend\src\components\SystemConfigPanel.tsx
+================================================================================
+
+import React, { useState, useEffect } from "react";
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Settings, Database, Server, Key, Trash2, CheckCircle2, AlertCircle } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+
+export function SystemConfigPanel() {
+  const [dbStatus, setDbStatus] = useState({ neo4j: "Checking...", lancedb: "Checking..." });
+  const [clearing, setClearing] = useState(false);
+  const [cleared, setCleared] = useState(false);
+  
+  const [targets, setTargets] = useState<any[]>([]);
+  const [newTargetUrl, setNewTargetUrl] = useState("");
+  const [newTargetType, setNewTargetType] = useState("Surface Web");
+
+  const fetchTargets = async () => {
+    try {
+      const res = await fetch("/api/v1/scraper/targets");
+      if (res.ok) setTargets(await res.json());
+    } catch (e) {
+      console.error("Failed to fetch targets");
+    }
+  };
+
+  useEffect(() => {
+    const fetchHealth = async () => {
+      try {
+        const res = await fetch("/api/v1/health");
+        if (res.ok) {
+          const data = await res.json();
+          setDbStatus(data);
+        }
+      } catch (e) {
+        setDbStatus({ neo4j: "Error", lancedb: "Error" });
+      }
+    };
+    fetchHealth();
+    fetchTargets();
+    const timer = setInterval(fetchHealth, 5000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const handleAddTarget = async () => {
+    if (!newTargetUrl) return;
+    try {
+      await fetch("/api/v1/scraper/targets", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: newTargetUrl, type: newTargetType })
+      });
+      setNewTargetUrl("");
+      fetchTargets();
+    } catch (e) {
+      console.error("Failed to add target");
+    }
+  };
+
+  const handleDeleteTarget = async (url: string) => {
+    try {
+      await fetch(`/api/v1/scraper/targets?url=${encodeURIComponent(url)}`, { method: "DELETE" });
+      fetchTargets();
+    } catch (e) {
+      console.error("Failed to delete target");
+    }
+  };
+
+  const handleFlushData = async () => {
+    setClearing(true);
+    try {
+      await fetch("/api/v1/flush", { method: "DELETE" });
+      setCleared(true);
+      setTimeout(() => setCleared(false), 3000);
+    } catch (e) {
+      console.error("Failed to flush data");
+    } finally {
+      setClearing(false);
+    }
+  };
+
+  return (
+    <div className="w-full h-full max-w-5xl mx-auto flex flex-col gap-6 pt-4">
+      <div>
+        <h2 className="text-2xl font-bold tracking-tight mb-2 flex items-center gap-2">
+          <Settings className="w-6 h-6 text-primary" /> System Configuration
+        </h2>
+        <p className="text-muted-foreground text-sm">
+          Manage backend connections, API keys, and autonomous scraper targets.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        
+        {/* Connection Status */}
+        <Card className="border-border/50 bg-card/40">
+          <CardHeader className="border-b border-border/30 bg-black/20 pb-3">
+            <CardTitle className="text-sm flex items-center gap-2 uppercase tracking-widest text-muted-foreground">
+              <Database className="w-4 h-4" /> Database Status
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="p-4 flex flex-col gap-4">
+            <div className="flex items-center justify-between">
+              <span className="font-medium text-sm">Neo4j Graph Database</span>
+              <Badge variant="outline" className={dbStatus.neo4j === "Connected" ? "bg-green-500/10 text-green-400 border-green-500/50" : "bg-red-500/10 text-red-400 border-red-500/50"}>
+                {dbStatus.neo4j}
+              </Badge>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="font-medium text-sm">LanceDB Vector Vault</span>
+              <Badge variant="outline" className={dbStatus.lancedb === "Connected" ? "bg-green-500/10 text-green-400 border-green-500/50" : "bg-red-500/10 text-red-400 border-red-500/50"}>
+                {dbStatus.lancedb}
+              </Badge>
+            </div>
+            <div className="pt-4 border-t border-border/50">
+              <button 
+                onClick={handleFlushData}
+                disabled={clearing}
+                className="flex items-center gap-2 px-4 py-2 w-full justify-center bg-destructive/10 text-destructive font-medium text-sm rounded-md border border-destructive/30 hover:bg-destructive/20 transition-colors"
+              >
+                {clearing ? <Trash2 className="w-4 h-4 animate-spin" /> : (cleared ? <CheckCircle2 className="w-4 h-4" /> : <Trash2 className="w-4 h-4" />)}
+                {clearing ? "Flushing Data..." : (cleared ? "Data Flushed!" : "Flush All Graph & Vector Data")}
+              </button>
+              <p className="text-xs text-muted-foreground mt-2 text-center">Warning: This will clear all intelligence.</p>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* API Keys */}
+        <Card className="border-border/50 bg-card/40">
+          <CardHeader className="border-b border-border/30 bg-black/20 pb-3">
+            <CardTitle className="text-sm flex items-center gap-2 uppercase tracking-widest text-muted-foreground">
+              <Key className="w-4 h-4" /> LLM Configuration
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="p-4 flex flex-col gap-4">
+            <div className="flex items-center justify-between">
+              <span className="font-medium text-sm">Primary Swarm Engine</span>
+              <span className="text-xs font-mono bg-black/30 px-2 py-1 rounded">Gemini-3.1-Flash-Lite</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="font-medium text-sm">Gemini API Key</span>
+              <span className="text-xs font-mono text-muted-foreground">********************</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="font-medium text-sm">Groq Fallback API Key</span>
+              <span className="text-xs font-mono text-muted-foreground">********************</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="font-medium text-sm">CrewAI Logging</span>
+              <Badge variant="outline" className="bg-blue-500/10 text-blue-400 border-blue-500/50">
+                Verbose
+              </Badge>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Scraper Targets */}
+        <Card className="border-border/50 bg-card/40 md:col-span-2">
+          <CardHeader className="border-b border-border/30 bg-black/20 pb-3 flex flex-row items-center justify-between">
+            <CardTitle className="text-sm flex items-center gap-2 uppercase tracking-widest text-muted-foreground">
+              <Server className="w-4 h-4" /> Autonomous Scraper Targets
+            </CardTitle>
+            <Badge variant="outline" className="bg-green-500/10 text-green-400 border-green-500/50 animate-pulse">
+              Scraper Active
+            </Badge>
+          </CardHeader>
+          <CardContent className="p-0">
+            <table className="w-full text-sm">
+              <thead className="bg-black/40 text-muted-foreground text-xs uppercase tracking-wider">
+                <tr>
+                  <th className="px-4 py-3 text-left font-medium">Source URL</th>
+                  <th className="px-4 py-3 text-left font-medium">Type</th>
+                  <th className="px-4 py-3 text-left font-medium">Status</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border/50">
+                {targets.map((target, idx) => (
+                  <tr key={idx} className="hover:bg-white/5 transition-colors">
+                    <td className="px-4 py-3 font-mono text-xs">{target.url}</td>
+                    <td className="px-4 py-3">{target.type}</td>
+                    <td className="px-4 py-3 flex gap-2 items-center">
+                      <Badge variant="outline" className="text-green-400 border-green-500/50">Active</Badge>
+                      <button onClick={() => handleDeleteTarget(target.url)} className="text-red-400 hover:text-red-300 ml-2">Delete</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <div className="p-4 flex gap-2 bg-black/20">
+              <input
+                type="text"
+                placeholder="Target URL..."
+                value={newTargetUrl}
+                onChange={(e) => setNewTargetUrl(e.target.value)}
+                className="flex-1 bg-background border border-border/50 rounded-md px-3 py-1.5 text-sm"
+              />
+              <select
+                value={newTargetType}
+                onChange={(e) => setNewTargetType(e.target.value)}
+                className="bg-background border border-border/50 rounded-md px-3 py-1.5 text-sm"
+              >
+                <option value="Surface Web">Surface Web</option>
+                <option value="Telegram">Telegram</option>
+                <option value="Deep Web (.onion)">Deep Web (.onion)</option>
+              </select>
+              <button onClick={handleAddTarget} className="bg-primary/20 text-primary border border-primary/50 hover:bg-primary/30 px-4 py-1.5 rounded-md text-sm transition-colors">
+                Add Target
+              </button>
+            </div>
+          </CardContent>
+        </Card>
+
+      </div>
+    </div>
+  );
+}
+
+
+================================================================================
+File: .\frontend\src\components\ui\badge.tsx
+================================================================================
+
+import { mergeProps } from "@base-ui/react/merge-props"
+import { useRender } from "@base-ui/react/use-render"
+import { cva, type VariantProps } from "class-variance-authority"
+
+import { cn } from "@/lib/utils"
+
+const badgeVariants = cva(
+  "group/badge inline-flex h-5 w-fit shrink-0 items-center justify-center gap-1 overflow-hidden rounded-4xl border border-transparent px-2 py-0.5 text-xs font-medium whitespace-nowrap transition-all focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/50 has-data-[icon=inline-end]:pr-1.5 has-data-[icon=inline-start]:pl-1.5 aria-invalid:border-destructive aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 [&>svg]:pointer-events-none [&>svg]:size-3!",
+  {
+    variants: {
+      variant: {
+        default: "bg-primary text-primary-foreground [a]:hover:bg-primary/80",
+        secondary:
+          "bg-secondary text-secondary-foreground [a]:hover:bg-secondary/80",
+        destructive:
+          "bg-destructive/10 text-destructive focus-visible:ring-destructive/20 dark:bg-destructive/20 dark:focus-visible:ring-destructive/40 [a]:hover:bg-destructive/20",
+        outline:
+          "border-border text-foreground [a]:hover:bg-muted [a]:hover:text-muted-foreground",
+        ghost:
+          "hover:bg-muted hover:text-muted-foreground dark:hover:bg-muted/50",
+        link: "text-primary underline-offset-4 hover:underline",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+    },
+  }
+)
+
+function Badge({
+  className,
+  variant = "default",
+  render,
+  ...props
+}: useRender.ComponentProps<"span"> & VariantProps<typeof badgeVariants>) {
+  return useRender({
+    defaultTagName: "span",
+    props: mergeProps<"span">(
+      {
+        className: cn(badgeVariants({ variant }), className),
+      },
+      props
+    ),
+    render,
+    state: {
+      slot: "badge",
+      variant,
+    },
+  })
+}
+
+export { Badge, badgeVariants }
+
+
+================================================================================
+File: .\frontend\src\components\ui\button.tsx
+================================================================================
+
+import { Button as ButtonPrimitive } from "@base-ui/react/button"
+import { cva, type VariantProps } from "class-variance-authority"
+
+import { cn } from "@/lib/utils"
+
+const buttonVariants = cva(
+  "group/button inline-flex shrink-0 items-center justify-center rounded-lg border border-transparent bg-clip-padding text-sm font-medium whitespace-nowrap transition-all outline-none select-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 active:not-aria-[haspopup]:translate-y-px disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-3 aria-invalid:ring-destructive/20 dark:aria-invalid:border-destructive/50 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+  {
+    variants: {
+      variant: {
+        default: "bg-primary text-primary-foreground hover:bg-primary/80",
+        outline:
+          "border-border bg-background hover:bg-muted hover:text-foreground aria-expanded:bg-muted aria-expanded:text-foreground dark:border-input dark:bg-input/30 dark:hover:bg-input/50",
+        secondary:
+          "bg-secondary text-secondary-foreground hover:bg-[color-mix(in_oklch,var(--secondary),var(--foreground)_5%)] aria-expanded:bg-secondary aria-expanded:text-secondary-foreground",
+        ghost:
+          "hover:bg-muted hover:text-foreground aria-expanded:bg-muted aria-expanded:text-foreground dark:hover:bg-muted/50",
+        destructive:
+          "bg-destructive/10 text-destructive hover:bg-destructive/20 focus-visible:border-destructive/40 focus-visible:ring-destructive/20 dark:bg-destructive/20 dark:hover:bg-destructive/30 dark:focus-visible:ring-destructive/40",
+        link: "text-primary underline-offset-4 hover:underline",
+      },
+      size: {
+        default:
+          "h-8 gap-1.5 px-2.5 has-data-[icon=inline-end]:pr-2 has-data-[icon=inline-start]:pl-2",
+        xs: "h-6 gap-1 rounded-[min(var(--radius-md),10px)] px-2 text-xs in-data-[slot=button-group]:rounded-lg has-data-[icon=inline-end]:pr-1.5 has-data-[icon=inline-start]:pl-1.5 [&_svg:not([class*='size-'])]:size-3",
+        sm: "h-7 gap-1 rounded-[min(var(--radius-md),12px)] px-2.5 text-[0.8rem] in-data-[slot=button-group]:rounded-lg has-data-[icon=inline-end]:pr-1.5 has-data-[icon=inline-start]:pl-1.5 [&_svg:not([class*='size-'])]:size-3.5",
+        lg: "h-9 gap-1.5 px-2.5 has-data-[icon=inline-end]:pr-2 has-data-[icon=inline-start]:pl-2",
+        icon: "size-8",
+        "icon-xs":
+          "size-6 rounded-[min(var(--radius-md),10px)] in-data-[slot=button-group]:rounded-lg [&_svg:not([class*='size-'])]:size-3",
+        "icon-sm":
+          "size-7 rounded-[min(var(--radius-md),12px)] in-data-[slot=button-group]:rounded-lg",
+        "icon-lg": "size-9",
+      },
+    },
+    defaultVariants: {
+      variant: "default",
+      size: "default",
+    },
+  }
+)
+
+function Button({
+  className,
+  variant = "default",
+  size = "default",
+  ...props
+}: ButtonPrimitive.Props & VariantProps<typeof buttonVariants>) {
+  return (
+    <ButtonPrimitive
+      data-slot="button"
+      className={cn(buttonVariants({ variant, size, className }))}
+      {...props}
+    />
+  )
+}
+
+export { Button, buttonVariants }
+
+
+================================================================================
+File: .\frontend\src\components\ui\card.tsx
+================================================================================
+
+import * as React from "react"
+
+import { cn } from "@/lib/utils"
+
+function Card({
+  className,
+  size = "default",
+  ...props
+}: React.ComponentProps<"div"> & { size?: "default" | "sm" }) {
+  return (
+    <div
+      data-slot="card"
+      data-size={size}
+      className={cn(
+        "group/card flex flex-col gap-(--card-spacing) overflow-hidden rounded-xl bg-card py-(--card-spacing) text-sm text-card-foreground ring-1 ring-foreground/10 [--card-spacing:--spacing(4)] has-data-[slot=card-footer]:pb-0 has-[>img:first-child]:pt-0 data-[size=sm]:[--card-spacing:--spacing(3)] data-[size=sm]:has-data-[slot=card-footer]:pb-0 *:[img:first-child]:rounded-t-xl *:[img:last-child]:rounded-b-xl",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function CardHeader({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-header"
+      className={cn(
+        "group/card-header @container/card-header grid auto-rows-min items-start gap-1 rounded-t-xl px-(--card-spacing) has-data-[slot=card-action]:grid-cols-[1fr_auto] has-data-[slot=card-description]:grid-rows-[auto_auto] [.border-b]:pb-(--card-spacing)",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function CardTitle({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-title"
+      className={cn(
+        "font-heading text-base leading-snug font-medium group-data-[size=sm]/card:text-sm",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function CardDescription({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-description"
+      className={cn("text-sm text-muted-foreground", className)}
+      {...props}
+    />
+  )
+}
+
+function CardAction({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-action"
+      className={cn(
+        "col-start-2 row-span-2 row-start-1 self-start justify-self-end",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function CardContent({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-content"
+      className={cn("px-(--card-spacing)", className)}
+      {...props}
+    />
+  )
+}
+
+function CardFooter({ className, ...props }: React.ComponentProps<"div">) {
+  return (
+    <div
+      data-slot="card-footer"
+      className={cn(
+        "flex items-center rounded-b-xl border-t bg-muted/50 p-(--card-spacing)",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+export {
+  Card,
+  CardHeader,
+  CardFooter,
+  CardTitle,
+  CardAction,
+  CardDescription,
+  CardContent,
+}
+
+
+================================================================================
+File: .\frontend\src\components\ui\table.tsx
+================================================================================
+
+"use client"
+
+import * as React from "react"
+
+import { cn } from "@/lib/utils"
+
+function Table({ className, ...props }: React.ComponentProps<"table">) {
+  return (
+    <div
+      data-slot="table-container"
+      className="relative w-full overflow-x-auto"
+    >
+      <table
+        data-slot="table"
+        className={cn("w-full caption-bottom text-sm", className)}
+        {...props}
+      />
+    </div>
+  )
+}
+
+function TableHeader({ className, ...props }: React.ComponentProps<"thead">) {
+  return (
+    <thead
+      data-slot="table-header"
+      className={cn("[&_tr]:border-b", className)}
+      {...props}
+    />
+  )
+}
+
+function TableBody({ className, ...props }: React.ComponentProps<"tbody">) {
+  return (
+    <tbody
+      data-slot="table-body"
+      className={cn("[&_tr:last-child]:border-0", className)}
+      {...props}
+    />
+  )
+}
+
+function TableFooter({ className, ...props }: React.ComponentProps<"tfoot">) {
+  return (
+    <tfoot
+      data-slot="table-footer"
+      className={cn(
+        "border-t bg-muted/50 font-medium [&>tr]:last:border-b-0",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function TableRow({ className, ...props }: React.ComponentProps<"tr">) {
+  return (
+    <tr
+      data-slot="table-row"
+      className={cn(
+        "border-b transition-colors hover:bg-muted/50 has-aria-expanded:bg-muted/50 data-[state=selected]:bg-muted",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function TableHead({ className, ...props }: React.ComponentProps<"th">) {
+  return (
+    <th
+      data-slot="table-head"
+      className={cn(
+        "h-10 px-2 text-left align-middle font-medium whitespace-nowrap text-foreground [&:has([role=checkbox])]:pr-0",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function TableCell({ className, ...props }: React.ComponentProps<"td">) {
+  return (
+    <td
+      data-slot="table-cell"
+      className={cn(
+        "p-2 align-middle whitespace-nowrap [&:has([role=checkbox])]:pr-0",
+        className
+      )}
+      {...props}
+    />
+  )
+}
+
+function TableCaption({
+  className,
+  ...props
+}: React.ComponentProps<"caption">) {
+  return (
+    <caption
+      data-slot="table-caption"
+      className={cn("mt-4 text-sm text-muted-foreground", className)}
+      {...props}
+    />
+  )
+}
+
+export {
+  Table,
+  TableHeader,
+  TableBody,
+  TableFooter,
+  TableHead,
+  TableRow,
+  TableCell,
+  TableCaption,
+}
+
+
+================================================================================
+File: .\frontend\src\lib\utils.ts
+================================================================================
+
+import { clsx, type ClassValue } from "clsx"
+import { twMerge } from "tailwind-merge"
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs))
+}
+
+

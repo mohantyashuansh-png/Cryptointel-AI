@@ -1,0 +1,54 @@
+=========================================================
+      CRYPTOINTEL - HACKATHON DEMO SCRIPT & FEEDS
+=========================================================
+Keep this file open during your demo. You can copy-paste these exact inputs to guarantee a perfect presentation that shows off all the features!
+
+---------------------------------------------------------
+1. MANUAL INTEL DROP (Copy-paste these into the Manual Drop tab)
+---------------------------------------------------------
+
+FEED 1 (Triggers Bitcoin Forensics & Location Mapping):
+"URGENT INTERCEPT [Source: Telegram]: Payment of 0.5 BTC expected for the new shipment. Send funds directly to bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh. Transfer must hit by tonight before the border closes. The local operative is currently stationed in Dubai and will confirm receipt. If there are any issues, contact handler at +919876543210."
+-> What to point out to judges: Watch the AI extract the BTC address, phone number, and see the globe snap a red laser directly to Dubai! Also point out the live Etherscan/Blockchain ping.
+
+FEED 2 (Triggers Ethereum & Money Laundering in Russia):
+"PASTEBIN LEAK [Source: Dark Web Forum]: New crypto mixing service is now operational for all syndicate members. Send dirty ETH to 0x71C7656EC7ab88b098defB751B7401B5f6d8976F. Wash will be complete in 2 hours with a 5% fee. We have connections with local banks in Moscow for physical cashouts."
+-> What to point out to judges: Watch the Risk Scorer flag this as "Money Laundering", see the Globe target Moscow, and watch the Graph build a new connection.
+
+---------------------------------------------------------
+2. GLOBAL SEARCH (Use these in the Intelligence Graph top search bar)
+---------------------------------------------------------
+
+SEARCH 1 (By Wallet ID):
+bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh
+-> What to point out: Shows how fast you can pinpoint a specific crypto wallet out of thousands of nodes.
+
+SEARCH 2 (By Keyword / PII):
+Dubai
+-> What to point out: Shows that the graph can be instantly filtered by physical locations or extracted PII like phone numbers.
+
+---------------------------------------------------------
+3. SEMANTIC SEARCH (Use these in the Evidence Vault / Ask AI search bar)
+---------------------------------------------------------
+
+QUERY 1:
+"Show me any intercepts related to terrorist financing or weapon shipments using Bitcoin."
+-> What to point out: Explain that LanceDB vector embeddings allow it to understand the "meaning" of the query, not just exact keyword matches.
+
+QUERY 2:
+"Are there any operatives laundering money through Russian banks?"
+-> What to point out: Shows the power of natural language querying against raw intercepted dark web text.
+
+---------------------------------------------------------
+4. AUTONOMOUS SCRAPER TARGETS (Add these in System Config tab)
+---------------------------------------------------------
+
+TARGET 1 (Surface Web Drop):
+URL: https://pastebin.com/raw/D4RwS8GM
+Type: Surface Web
+-> What to point out: Shows how you can task the Playwright scraper to monitor public code/text dumps for leaked Intel.
+
+TARGET 2 (Dark Web Onion):
+URL: http://zqktlwiuavvvqqt4ybvgvi7tyo4hjl5xgfuvpdf6otjiycgwqbym2qad.onion/
+Type: Deep Web (.onion)
+-> What to point out: Shows that the scraper is configured to route through the Tor network to hit actual darknet marketplaces.

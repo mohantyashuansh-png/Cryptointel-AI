@@ -1,0 +1,13 @@
+crewai
+langchain-google-genai
+fastapi
+uvicorn
+python-dotenv
+pydantic
+neo4j
+requests
+requests[socks]
+lancedb
+langchain-huggingface
+sentence-transformers
+reportlab
