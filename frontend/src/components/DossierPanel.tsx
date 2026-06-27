@@ -1,11 +1,14 @@
 import React, { useState, useEffect } from "react";
-import { X, ShieldAlert, AlertTriangle, Link as LinkIcon, Phone, Mail, Activity, User, MapPin, Database, Network, BrainCircuit } from "lucide-react";
+import { X, ShieldAlert, AlertTriangle, Link as LinkIcon, Phone, Mail, Activity, User, MapPin, Database, Network, BrainCircuit, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 
-export function DossierPanel({ node, edges, onClose }: { node: any, edges: any[], onClose: () => void }) {
+export function DossierPanel({ node, edges, onClose, onTraceComplete }: { node: any, edges: any[], onClose: () => void, onTraceComplete?: () => void }) {
   const [profile, setProfile] = useState<any>(null);
   const [loadingProfile, setLoadingProfile] = useState(false);
+  const [explainData, setExplainData] = useState<any>(null);
+  const [loadingExplain, setLoadingExplain] = useState(false);
+  const [tracing, setTracing] = useState(false);
 
   useEffect(() => {
     if (!node) return;
@@ -44,18 +47,46 @@ export function DossierPanel({ node, edges, onClose }: { node: any, edges: any[]
   const isHighRisk = node.score && node.score > 50;
 
   return (
-    <div className="absolute top-0 right-0 h-full w-80 bg-card border-l border-border/50 shadow-2xl flex flex-col z-20 animate-in slide-in-from-right duration-300">
+    <div className="fixed top-0 right-0 h-screen w-80 glass-panel border-l border-border/50 shadow-2xl flex flex-col z-[100] dossier-enter">
       <div className="p-4 border-b border-border/30 flex justify-between items-center bg-black/40">
         <h3 className="font-bold text-lg flex items-center gap-2">
           {isHighRisk && <ShieldAlert className="w-5 h-5 text-destructive" />}
           Intelligence Dossier
         </h3>
-        <button onClick={onClose} className="text-muted-foreground hover:text-foreground transition-colors">
-          <X className="w-5 h-5" />
-        </button>
+        <div className="flex items-center gap-2">
+          <button 
+            onClick={async (e) => {
+              const btn = e.currentTarget;
+              btn.disabled = true;
+              if (confirm("Are you sure you want to delete this case and all its connections?")) {
+                try {
+                  await fetch(`/api/v1/entity/${encodeURIComponent(node.id)}`, { method: "DELETE" });
+                  if (onTraceComplete) onTraceComplete(); // Refresh graph
+                  onClose();
+                } catch (err) {
+                  alert("Failed to delete entity");
+                  btn.disabled = false;
+                }
+              } else {
+                btn.disabled = false;
+              }
+            }}
+            title="Delete Case"
+            className="text-destructive/70 hover:text-destructive transition-colors p-1"
+          >
+            <Trash2 className="w-4 h-4" />
+          </button>
+          <button onClick={onClose} className="text-muted-foreground hover:text-foreground transition-colors p-1">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
       </div>
 
-      <div className="p-4 flex-1 overflow-y-auto">
+      <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-0 overflow-hidden">
+        <div className="text-[6rem] font-black text-red-600/10 tracking-[0.2em] -rotate-45 select-none whitespace-nowrap">CLASSIFIED</div>
+      </div>
+
+      <div className="p-4 flex-1 overflow-y-auto relative z-10">
         <div className="mb-6">
           <label className="text-xs text-muted-foreground uppercase tracking-wider mb-1 block">Entity ID</label>
           <div className="font-mono text-sm break-all">{node.id}</div>
@@ -72,11 +103,46 @@ export function DossierPanel({ node, edges, onClose }: { node: any, edges: any[]
              <label className="text-xs text-muted-foreground uppercase tracking-wider mb-1 block">Sightings</label>
              <div className="font-mono text-sm">{node.sightings_count || 1}</div>
            </div>
-           <div className="text-right">
-             <label className="text-xs text-muted-foreground uppercase tracking-wider mb-1 block">Threat Score</label>
-             <div className={`text-xl font-bold ${isHighRisk ? 'text-destructive' : 'text-primary'}`}>
-                {node.score || 0}/100
+           <div className="text-right flex flex-col items-end">
+             <label className="text-xs text-white/50 uppercase tracking-widest mb-1 block font-bold">Threat Score</label>
+             <div className="font-mono text-xl font-bold flex items-center gap-3">
+               {node.score > 0 && !explainData && (
+                 <button 
+                   onClick={async () => {
+                     setLoadingExplain(true);
+                     try {
+                       const res = await fetch(`/api/v1/explain/${encodeURIComponent(node.id)}`);
+                       if (res.ok) setExplainData(await res.json());
+                     } catch(e) { console.error(e); }
+                     setLoadingExplain(false);
+                   }}
+                   className="text-[10px] text-cyan-400 uppercase tracking-widest border border-cyan-400/30 px-2 py-0.5 rounded hover:bg-cyan-400/10 transition-colors flex items-center gap-1"
+                   disabled={loadingExplain}
+                 >
+                   {loadingExplain ? <Activity className="w-3 h-3 animate-spin" /> : <BrainCircuit className="w-3 h-3" />} Explain
+                 </button>
+               )}
+               <span>
+                 <span className={(node.score || 0) > 60 ? 'text-destructive' : (node.score || 0) > 30 ? 'text-amber-400' : 'text-green-400'}>{node.score || 0}</span><span className="text-muted-foreground text-sm">/100</span>
+               </span>
              </div>
+             <div className="w-full h-1.5 bg-black/50 mt-2 rounded-full overflow-hidden flex items-center shadow-[inset_0_1px_3px_rgba(0,0,0,0.5)]">
+               <div className="h-full rounded-full transition-all duration-1000" style={{ width: `${Math.min(100, node.score || 0)}%`, background: (node.score || 0) > 60 ? '#ff5e67' : (node.score || 0) > 30 ? '#f1c15c' : '#63eba9', boxShadow: `0 0 10px ${(node.score || 0) > 60 ? '#ff5e67' : (node.score || 0) > 30 ? '#f1c15c' : '#63eba9'}` }}></div>
+             </div>
+             
+             {/* Score Explanation Box */}
+             {explainData && (
+               <div className="w-full text-left mt-3 bg-black/40 border border-border/50 p-3 rounded text-xs animate-in fade-in slide-in-from-top-2">
+                 <div className="text-white/80 italic mb-2 border-l-2 border-cyan-400/50 pl-2">
+                   {explainData.key_factors?.map((f: string, i: number) => <div key={i}>• {f}</div>)}
+                 </div>
+                 <div className="grid grid-cols-3 gap-1 text-[9px] text-center uppercase tracking-widest text-muted-foreground mt-2 border-t border-border/30 pt-2">
+                   <div>Fin. Exp<br/><span className="text-white font-mono">{explainData.breakdown?.financial_exposure || 0}/40</span></div>
+                   <div>Op. Sec<br/><span className="text-white font-mono">{explainData.breakdown?.operational_security || 0}/30</span></div>
+                   <div>Net. Cen<br/><span className="text-white font-mono">{explainData.breakdown?.network_centrality || 0}/30</span></div>
+                 </div>
+               </div>
+             )}
            </div>
         </div>
 
@@ -191,22 +257,39 @@ export function DossierPanel({ node, edges, onClose }: { node: any, edges: any[]
         )}
 
         {node.tx_count !== undefined && (
-            <div className="mb-6 bg-primary/10 p-3 rounded-md border border-primary/30">
-              <label className="text-xs text-primary uppercase tracking-wider mb-2 flex items-center gap-1">
-                 <Network className="w-3 h-3" /> Blockchain Forensics (Simulated API)
+            <div className="mb-6 bg-primary/5 p-3 rounded-md border border-primary/20 relative overflow-hidden">
+              <div className="absolute top-0 left-0 w-1 h-full bg-cyan-400" />
+              <label className="text-xs text-primary font-bold uppercase tracking-wider mb-2 flex items-center justify-between">
+                 <div className="flex items-center gap-1.5"><Network className="w-4 h-4" /> Trace Analysis</div>
+                 <button 
+                    onClick={async () => {
+                       setTracing(true);
+                       try {
+                         await fetch(`/api/v1/trace/${node.id}?crypto_type=${node.crypto_type || 'BTC'}&hops=3`);
+                         if (onTraceComplete) onTraceComplete();
+                       } catch (e) {
+                         console.error(e);
+                       }
+                       setTracing(false);
+                    }}
+                    disabled={tracing}
+                    className="bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 text-[10px] px-2.5 py-1 rounded transition-colors uppercase font-bold flex items-center gap-1"
+                 >
+                   {tracing ? <Activity className="w-3 h-3 animate-spin" /> : "▶ Trace On-Chain"}
+                 </button>
               </label>
               <div className="grid grid-cols-2 gap-4 mt-3">
                 <div>
-                  <div className="text-[10px] text-muted-foreground uppercase">Transaction Count</div>
-                  <div className="font-mono text-sm">{node.tx_count}</div>
+                  <div className="text-[10px] text-muted-foreground uppercase tracking-widest font-bold">Transaction Count</div>
+                  <div className="font-mono text-sm mt-0.5">{node.tx_count}</div>
                 </div>
                 <div>
-                  <div className="text-[10px] text-muted-foreground uppercase">Final Balance</div>
-                  <div className="font-mono text-sm">{node.final_balance}</div>
+                  <div className="text-[10px] text-muted-foreground uppercase tracking-widest font-bold">Final Balance</div>
+                  <div className="font-mono text-sm mt-0.5">{node.final_balance?.toFixed(4)}</div>
                 </div>
                 <div className="col-span-2">
-                  <div className="text-[10px] text-muted-foreground uppercase">Total Received</div>
-                  <div className="font-mono text-sm text-green-400">{node.total_received}</div>
+                  <div className="text-[10px] text-muted-foreground uppercase tracking-widest font-bold">Total Received</div>
+                  <div className="font-mono text-sm text-green-400 font-bold mt-0.5">{node.total_received?.toFixed(4)}</div>
                 </div>
               </div>
             </div>

@@ -7,16 +7,16 @@ def extract_all_code(directory, output_file="all_code.txt"):
     Ignores common binary files, hidden folders, and virtual environments.
     """
     # Folders to ignore so we don't extract useless or massive files
-    ignore_dirs = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.idea', '.vscode', '.next', 'evidence_vault'}
+    ignore_dirs = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.idea', '.vscode', '.next', 'evidence_vault', 'test_vault'}
     
     # Common non-text file extensions to ignore
     ignore_exts = {
         '.png', '.jpg', '.jpeg', '.gif', '.ico', '.svg', '.mp4', '.mp3', 
-        '.zip', '.tar', '.gz', '.pdf', '.exe', '.dll', '.so', '.pyc', '.pkl'
+        '.zip', '.tar', '.gz', '.pdf', '.exe', '.dll', '.so', '.pyc', '.pkl', '.db', '.sqlite'
     }
 
     # Specific files to ignore (like lock files or API keys)
-    ignore_files = {'package-lock.json', 'yarn.lock', '.env', '.env.local'}
+    ignore_files = {'package-lock.json', 'yarn.lock', '.env', '.env.local', 'all_code.txt'}
 
     if not os.path.exists(directory):
         print(f"Error: Directory '{directory}' not found.")
@@ -34,6 +34,12 @@ def extract_all_code(directory, output_file="all_code.txt"):
                     
                 ext = os.path.splitext(file)[1].lower()
                 if ext in ignore_exts:
+                    continue
+                    
+                # Skip massive logs and scratchpads
+                if ext == '.txt' and file != 'requirements.txt':
+                    continue
+                if file.startswith('test') and ext == '.py' and file != 'test_api.py':
                     continue
                 
                 # Make sure we don't try to extract the output file into itself

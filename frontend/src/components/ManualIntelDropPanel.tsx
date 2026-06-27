@@ -18,7 +18,7 @@ export function ManualIntelDropPanel() {
     setStatus({ type: "idle", message: "Analyzing..." });
 
     try {
-      const res = await fetch("/api/v1/investigate", {
+      const res = await fetch("http://127.0.0.1:8000/api/v1/investigate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

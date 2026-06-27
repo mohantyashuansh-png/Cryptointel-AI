@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge";
 
 export default function AskAIPanel() {
   const [query, setQuery] = useState("");
-  const [messages, setMessages] = useState<{role: 'user' | 'ai', content: string, sources?: number}[]>([]);
+  const [messages, setMessages] = useState<{role: 'user' | 'ai', content: string, cypher?: string, results?: any[], error?: string}[]>([]);
   const [loading, setLoading] = useState(false);
 
   const handleAsk = async () => {
@@ -25,11 +25,21 @@ export default function AskAIPanel() {
       });
       
       const data = await res.json();
-      setMessages(prev => [...prev, { 
-        role: 'ai', 
-        content: data.answer || "Error connecting to AI.", 
-        sources: data.sources 
-      }]);
+      
+      if (data.error) {
+        setMessages(prev => [...prev, { 
+          role: 'ai', 
+          content: `Error: ${data.error}`,
+          error: data.error
+        }]);
+      } else {
+        setMessages(prev => [...prev, { 
+          role: 'ai', 
+          content: data.nl_summary || "No summary provided.",
+          cypher: data.cypher,
+          results: data.results
+        }]);
+      }
     } catch (err) {
       setMessages(prev => [...prev, { role: 'ai', content: "Failed to connect to backend server." }]);
     } finally {
@@ -43,7 +53,7 @@ export default function AskAIPanel() {
         <CardTitle className="flex justify-between items-center text-lg">
           <span className="flex items-center gap-2"><Brain className="w-5 h-5 text-purple-500" /> SEMANTIC SEARCH (Ask AI)</span>
           <Badge variant="outline" className="font-mono text-xs text-muted-foreground bg-background/50 flex gap-2">
-            <Database className="w-3 h-3 text-blue-500" /> LanceDB + Groq Llama-3
+            <Database className="w-3 h-3 text-blue-500" /> Gemini NL-to-Cypher + Neo4j
           </Badge>
         </CardTitle>
       </CardHeader>
@@ -53,10 +63,10 @@ export default function AskAIPanel() {
           {messages.length === 0 && (
             <div className="h-full flex flex-col items-center justify-center text-muted-foreground opacity-50 gap-4">
               <Brain className="w-16 h-16" />
-              <p>Ask anything about the intercepted data.</p>
+              <p>Ask anything about the intelligence graph.</p>
               <div className="text-xs text-center max-w-sm">
-                "Are there any wallets linked to Terror Financing?"<br/>
-                "What is the contact email for ShadowBroker99?"
+                "Show me all wallets linked to Russia"<br/>
+                "Which wallets have the highest threat score?"
               </div>
             </div>
           )}
@@ -65,16 +75,26 @@ export default function AskAIPanel() {
             <div key={i} className={`flex flex-col gap-1.5 ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
               <div className={`text-[10px] uppercase tracking-widest text-muted-foreground flex gap-2 items-center`}>
                 {m.role === 'user' ? 'ANALYST QUERY' : 'CRYPTOINTEL AI'}
-                {m.sources !== undefined && m.sources > 0 && (
-                  <span className="text-blue-500">[{m.sources} SOURCES]</span>
-                )}
               </div>
-              <div className={`p-3 rounded-md max-w-[85%] whitespace-pre-wrap ${
+              <div className={`p-3 rounded-md max-w-[85%] whitespace-pre-wrap overflow-x-auto ${
                 m.role === 'user' 
                   ? 'bg-primary/20 border border-primary/30 text-primary-foreground' 
-                  : 'bg-black/40 border border-border/50 text-muted-foreground'
+                  : 'bg-black/40 border border-border/50 text-muted-foreground text-xs'
               }`}>
                 {m.content}
+                
+                {m.cypher && (
+                  <details className="mt-3 border-t border-border/30 pt-2 cursor-pointer">
+                    <summary className="text-[10px] text-primary/70 hover:text-primary transition-colors">Show Query & Raw Data</summary>
+                    <div className="mt-2 text-left bg-black/60 p-2 rounded border border-border/30">
+                      <div className="text-[10px] text-purple-400 mb-1">Generated Cypher:</div>
+                      <code className="text-[10px] text-muted-foreground block mb-3">{m.cypher}</code>
+                      
+                      <div className="text-[10px] text-blue-400 mb-1">Raw JSON Results:</div>
+                      <code className="text-[10px] text-muted-foreground block">{JSON.stringify(m.results, null, 2)}</code>
+                    </div>
+                  </details>
+                )}
               </div>
             </div>
           ))}
@@ -83,7 +103,7 @@ export default function AskAIPanel() {
               <div className="text-[10px] uppercase tracking-widest text-muted-foreground">CRYPTOINTEL AI</div>
               <div className="p-3 rounded-md bg-black/40 border border-border/50 text-muted-foreground flex items-center gap-2">
                 <Loader2 className="w-4 h-4 animate-spin text-purple-500" />
-                Querying LanceDB vectors & generating response...
+                Generating Cypher and querying Neo4j...
               </div>
             </div>
           )}

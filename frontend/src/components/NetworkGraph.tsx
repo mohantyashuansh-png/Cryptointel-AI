@@ -10,6 +10,8 @@ export default function NetworkGraph({ nodes, edges, onNodeClick, recenterTrigge
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
   const containerRef = useRef<HTMLDivElement>(null);
   const [isLegendOpen, setIsLegendOpen] = useState(true);
+  const [hoverNode, setHoverNode] = useState<any>(null);
+  const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
 
   // Resize observer to make graph responsive to the container
   useEffect(() => {
@@ -83,7 +85,7 @@ export default function NetworkGraph({ nodes, edges, onNodeClick, recenterTrigge
   // The edges need 'source' and 'target' which map to node 'id's.
 
   return (
-    <div ref={containerRef} className="w-full h-full relative" style={{ minHeight: '400px' }}>
+    <div ref={containerRef} className="w-full h-full relative" style={{ minHeight: '400px' }} onMouseMove={(e) => setMousePos({ x: e.clientX, y: e.clientY })}>
       <ForceGraph2D
         ref={fgRef}
         width={dimensions.width}
@@ -93,6 +95,7 @@ export default function NetworkGraph({ nodes, edges, onNodeClick, recenterTrigge
         dagMode="lr"
         dagLevelDistance={80}
         onNodeClick={onNodeClick}
+        onNodeHover={setHoverNode}
         nodeRelSize={6}
         nodeVal={(node: any) => Math.max(4, (node.score || 10) / 10)}
         linkColor={(link: any) => link.relation === 'TRANSACTED_WITH' ? 'rgba(34, 197, 94, 0.6)' : 'rgba(100, 116, 139, 0.4)'}
@@ -148,6 +151,21 @@ export default function NetworkGraph({ nodes, edges, onNodeClick, recenterTrigge
           ctx.shadowColor = color;
           ctx.shadowBlur = 10;
           
+          // Draw sonar pulse
+          const isHighRisk = (node.score || 0) > 80 || node.category === 'Terror Financing';
+          const time = Date.now();
+          const t = isHighRisk ? (time % 1500) / 1500 : (time % 2000) / 2000;
+          const pulseRadius = radius + (t * radius * (isHighRisk ? 3 : 1.5));
+          const opacity = Math.max(0, 1 - t);
+          
+          ctx.beginPath();
+          ctx.arc(node.x, node.y, pulseRadius, 0, 2 * Math.PI, false);
+          ctx.fillStyle = isHighRisk ? `rgba(239, 68, 68, ${opacity * 0.4})` : `rgba(28, 231, 239, ${opacity * 0.2})`;
+          ctx.fill();
+          ctx.strokeStyle = isHighRisk ? `rgba(239, 68, 68, ${opacity * 0.6})` : `rgba(28, 231, 239, ${opacity * 0.4})`;
+          ctx.lineWidth = 1 / globalScale;
+          ctx.stroke();
+          
           ctx.beginPath();
           if (node.type === "Wallet") {
             // Draw Node Circle for Wallets
@@ -183,8 +201,24 @@ export default function NetworkGraph({ nodes, edges, onNodeClick, recenterTrigge
           }
         }}
       />
+      
+      {/* Node Hover Tooltip */}
+      {hoverNode && (
+        <div 
+          className="fixed pointer-events-none z-50 glass-panel p-3 rounded-md shadow-2xl animate-in fade-in zoom-in-95 border border-primary/40 bg-black/80 backdrop-blur-md"
+          style={{ left: mousePos.x + 15, top: mousePos.y + 15 }}
+        >
+          <div className="font-mono text-xs text-primary mb-1">{hoverNode.id}</div>
+          <div className="flex justify-between gap-4 text-[10px] text-muted-foreground uppercase font-bold tracking-wider">
+            <span>{hoverNode.category || 'Unknown'}</span>
+            <span className={hoverNode.score > 50 ? 'text-destructive' : 'text-green-400'}>Score: {hoverNode.score || 0}</span>
+          </div>
+        </div>
+      )}
 
-      {/* Legend has been moved to the unified system legends box in page.tsx */}
+      {/* Legend */}
+      <div className={`absolute top-4 left-4 z-10 transition-all duration-300 ${isLegendOpen ? 'translate-x-0 opacity-100' : '-translate-x-full opacity-0'}`}>
+      </div>
     </div>
   );
 }

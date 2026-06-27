@@ -46,8 +46,12 @@ try:
     from langchain_huggingface import HuggingFaceEmbeddings
     # Initialize LanceDB
     lancedb_client = lancedb.connect("./evidence_vault")
-    hf_embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
-    print("[SYSTEM] LanceDB and HuggingFace Embeddings Initialized.")
+    # Force model onto RTX 2050 GPU (CUDA) if available
+    hf_embeddings = HuggingFaceEmbeddings(
+        model_name="BAAI/bge-small-en-v1.5",
+        model_kwargs={'device': 'cuda'}
+    )
+    print("[SYSTEM] LanceDB and HuggingFace Embeddings Initialized (GPU Accelerated).")
 except Exception as e:
     print(f"[ERROR] Failed to initialize LanceDB/Embeddings: {e}")
     lancedb_client = None
@@ -118,13 +122,21 @@ async def get_logs():
 
 def enrich_btc_address(address: str):
     try:
-        res = requests.get(f"https://blockchain.info/rawaddr/{address}?limit=0", timeout=5)
+        res = requests.get(f"https://mempool.space/api/address/{address}", timeout=5)
         if res.status_code == 200:
             data = res.json()
+            cs = data.get("chain_stats", {})
+            ms = data.get("mempool_stats", {})
+            
+            tx_count = cs.get("tx_count", 0) + ms.get("tx_count", 0)
+            total_received_sat = cs.get("funded_txo_sum", 0) + ms.get("funded_txo_sum", 0)
+            total_spent_sat = cs.get("spent_txo_sum", 0) + ms.get("spent_txo_sum", 0)
+            final_balance_sat = total_received_sat - total_spent_sat
+            
             return {
-                "tx_count": data.get("n_tx", 0),
-                "total_received": data.get("total_received", 0) / 100000000, # BTC
-                "final_balance": data.get("final_balance", 0) / 100000000, # BTC
+                "tx_count": tx_count,
+                "total_received": total_received_sat / 100000000.0, # BTC
+                "final_balance": final_balance_sat / 100000000.0, # BTC
             }
     except Exception:
         pass
@@ -204,44 +216,53 @@ def inject_into_graph(intelligence_matrix):
         # -------------------------------------------------------------
         # Live Blockchain Forensics: Expand graph automatically
         # -------------------------------------------------------------
-        for node in nodes:
-            node_id = node.get("id")
-            node_type = node.get("type", "")
-            crypto_type = node.get("crypto_type", "")
-            
-            if node_type == "Wallet" and crypto_type in ["BTC", "ETH"]:
-                txs = trace_wallet(node_id, crypto_type)
-                for tx in txs:
-                    sender = tx["from"]
-                    receiver = tx["to"]
-                    amount = tx["value"]
-                    tx_hash = tx["hash"]
+        import threading
+        
+        def run_forensics_background(nodes_to_trace):
+            if not driver:
+                return
+            with driver.session() as bg_session:
+                bg_nodes_count = 0
+                bg_edges_count = 0
+                for node in list(nodes_to_trace):
+                    node_id = node.get("id")
+                    node_type = node.get("type", "")
+                    crypto_type = node.get("crypto_type", "")
                     
-                    # Prevent tracing 0 value or missing txs
-                    if not sender or not receiver or amount <= 0:
-                        continue
-                        
-                    # Create the connected nodes
-                    for peer in [sender, receiver]:
-                        peer_query = f"""
-                        MERGE (n:Wallet {{id: $id}})
-                        ON CREATE SET n.timestamp = $timestamp, n.crypto_type = $crypto_type, n.category = 'Unknown', n.source_url = 'On-Chain Forensics'
-                        """
-                        session.run(peer_query, id=peer, timestamp=datetime.utcnow().isoformat(), crypto_type=crypto_type)
-                    
-                    # Create the TRANSACTED_WITH edge
-                    edge_query = f"""
-                    MATCH (a:Wallet {{id: $sender}})
-                    MATCH (b:Wallet {{id: $receiver}})
-                    MERGE (a)-[r:TRANSACTED_WITH {{tx_hash: $tx_hash}}]->(b)
-                    ON CREATE SET r.amount = $amount
-                    """
-                    session.run(edge_query, sender=sender, receiver=receiver, tx_hash=tx_hash, amount=amount)
-                    edges.append({"from": sender, "to": receiver, "relation": "TRANSACTED_WITH", "amount": amount})
-                    nodes.append({"id": sender, "type": "Wallet", "crypto_type": crypto_type})
-                    nodes.append({"id": receiver, "type": "Wallet", "crypto_type": crypto_type})
-                    
-    print(f"[NEO4J] Injected {len(nodes)} nodes and {len(edges)} edges into graph (including forensics).")
+                    if node_type == "Wallet" and crypto_type in ["BTC", "ETH"]:
+                        txs = trace_wallet(node_id, crypto_type)
+                        for tx in txs:
+                            sender = tx["from"]
+                            receiver = tx["to"]
+                            amount = tx["value"]
+                            tx_hash = tx["hash"]
+                            
+                            if not sender or not receiver or amount <= 0:
+                                continue
+                                
+                            for peer in [sender, receiver]:
+                                peer_query = f"""
+                                MERGE (n:Wallet {{id: $id}})
+                                ON CREATE SET n.timestamp = $timestamp, n.crypto_type = $crypto_type, n.category = 'Unknown', n.source_url = 'On-Chain Forensics'
+                                """
+                                bg_session.run(peer_query, id=peer, timestamp=datetime.utcnow().isoformat(), crypto_type=crypto_type)
+                            
+                            edge_query = f"""
+                            MATCH (a:Wallet {{id: $sender}})
+                            MATCH (b:Wallet {{id: $receiver}})
+                            MERGE (a)-[r:TRANSACTED_WITH {{tx_hash: $tx_hash}}]->(b)
+                            ON CREATE SET r.amount = $amount
+                            """
+                            bg_session.run(edge_query, sender=sender, receiver=receiver, tx_hash=tx_hash, amount=amount)
+                            bg_nodes_count += 2
+                            bg_edges_count += 1
+                if bg_nodes_count > 0:
+                    print(f"[FORENSICS-BG] Injected {bg_nodes_count} background nodes and {bg_edges_count} edges.")
+
+        threading.Thread(target=run_forensics_background, args=(nodes,)).start()
+        
+    print(f"[NEO4J] Base injection complete (forensics running in background).")
+
 
 
 @app.post("/api/v1/investigate")
@@ -434,6 +455,139 @@ async def export_json(days: int = 30, category: str = "All Categories", search: 
         
     return {"nodes": nodes, "edges": edges}
 
+
+@app.get("/api/v1/explain/{node_id}")
+async def explain_score(node_id: str):
+    """Explains the threat score for a node using Gemini."""
+    if not driver:
+        raise HTTPException(status_code=500, detail="Neo4j not connected.")
+        
+    with driver.session() as session:
+        query = "MATCH (n) WHERE n.id = $node_id RETURN n.desc as desc, n.category as category, n.score as score, n.type as type"
+        res = session.run(query, node_id=node_id).single()
+        
+    if not res:
+        raise HTTPException(status_code=404, detail="Node not found.")
+        
+    desc = res["desc"] or "No context available."
+    score = res["score"] or 0
+    category = res["category"] or "Unknown"
+    
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY_1")
+    if not api_key:
+        return {
+            "score": score,
+            "breakdown": {"financial_exposure": 0, "operational_security": 0, "network_centrality": 0},
+            "key_factors": ["AI explanation disabled (No API key found)"],
+            "confidence": "Unknown"
+        }
+        
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={api_key}"
+        prompt = f"""You are an elite cyber intelligence profiler. Explain why this entity received a threat score of {score}/100.
+Category: {category}
+Context: {desc}
+
+Return ONLY a valid JSON object with EXACTLY these keys:
+"score": {score}
+"breakdown": {{ "financial_exposure": (0-40), "operational_security": (0-30), "network_centrality": (0-30) }}
+"key_factors": [ list 3 short sentences explaining the biggest risks ]
+"confidence": "High", "Moderate", or "Low"
+"""
+        payload = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.2}}
+        resp = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
+        resp.raise_for_status()
+        
+        reply = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        reply = reply.strip().replace("```json", "").replace("```", "").strip()
+        
+        return json.loads(reply)
+    except Exception as e:
+        print("Gemini API Error in explain:", e)
+        return {
+            "score": score,
+            "breakdown": {"error": 1},
+            "key_factors": [f"Failed to generate explanation: {str(e)}"],
+            "confidence": "Error"
+        }
+
+@app.get("/api/v1/analytics")
+async def graph_analytics():
+    """Runs Cypher graph algorithms to find central entities and clusters."""
+    if not driver:
+        raise HTTPException(status_code=500, detail="Neo4j not connected.")
+    
+    with driver.session() as session:
+        # Most connected (Degree Centrality proxy)
+        connected_query = """
+        MATCH (n)-[r]-() 
+        WHERE (n.score IS NOT NULL AND n.score > 0) OR n.category IN ['Narcotics', 'Terror Financing', 'Money Laundering', 'Cybercrime']
+        WITH n, count(r) as degree 
+        ORDER BY degree DESC LIMIT 5 
+        RETURN n.id as id, n.category as category, degree
+        """
+        connected_res = session.run(connected_query)
+        most_connected = [{"id": r["id"], "degree": r["degree"], "category": r["category"]} for r in connected_res]
+        
+        # Clusters proxy (Count components / categories)
+        cluster_query = """
+        MATCH (n) WHERE n.category IS NOT NULL AND n.category <> 'Unknown'
+        RETURN n.category as category, count(n) as count ORDER BY count DESC LIMIT 5
+        """
+        cluster_res = session.run(cluster_query)
+        clusters = [{"category": r["category"], "count": r["count"]} for r in cluster_res]
+        
+        # Key bridges (Entities connecting many others)
+        # We look for nodes with both INCOMING and OUTGOING transactions/links
+        bridge_query = """
+        MATCH ()-[r1]->(n)-[r2]->()
+        WITH n, count(DISTINCT r1) as in_deg, count(DISTINCT r2) as out_deg
+        WHERE in_deg > 1 AND out_deg > 1
+        RETURN n.id as id, in_deg, out_deg, n.category as category
+        ORDER BY (in_deg + out_deg) DESC LIMIT 3
+        """
+        bridge_res = session.run(bridge_query)
+        bridges = [{"id": r["id"], "note": f"Acts as an intermediary bridge (In: {r['in_deg']}, Out: {r['out_deg']})", "category": r["category"]} for r in bridge_res]
+
+    return {
+        "most_connected": most_connected,
+        "cluster_summary": {
+            "total_categories": len(clusters),
+            "top_clusters": clusters
+        },
+        "key_bridges": bridges
+    }
+
+@app.get("/api/v1/threat-delta")
+async def threat_delta():
+    """Calculates 24h threat intelligence delta."""
+    if not driver:
+        raise HTTPException(status_code=500, detail="Neo4j not connected.")
+        
+    with driver.session() as session:
+        query_24h = """
+        MATCH (n)
+        WHERE datetime(n.timestamp) >= datetime() - duration({hours: 24})
+        RETURN count(n) as new_entities, 
+               sum(CASE WHEN n.score > 50 THEN 1 ELSE 0 END) as new_high_risk,
+               collect(DISTINCT n.category) as new_categories
+        """
+        res = session.run(query_24h).single()
+        
+    new_entities = res["new_entities"]
+    new_high_risk = res["new_high_risk"]
+    categories = [c for c in res["new_categories"] if c and c != "Unknown"]
+    
+    delta_summary = f"Activity surged with {new_entities} new entities logged in the last 24 hours."
+    if new_high_risk > 0:
+        delta_summary += f" Including {new_high_risk} high-risk targets."
+        
+    return {
+        "new_entities_today": new_entities,
+        "new_high_risk_today": new_high_risk,
+        "emerging_categories": categories,
+        "delta_summary": delta_summary
+    }
 
 @app.get("/api/v1/profile/{node_id}")
 async def get_node_profile(node_id: str):
@@ -791,6 +945,60 @@ async def export_pdf():
         headers={"Content-Disposition": "attachment; filename=crypto_intelligence_export.pdf"}
     )
 
+@app.get("/api/v1/trace/{wallet_address}")
+async def deep_trace(wallet_address: str, crypto_type: str = "BTC", hops: int = 3):
+    """Deep multi-hop blockchain forensics trace."""
+    from blockchain_forensics import trace_wallet_deep
+    
+    edges = trace_wallet_deep(wallet_address, crypto_type, max_hops=hops)
+    
+    # Inject discovered nodes/edges into Neo4j
+    if driver and edges:
+        with driver.session() as session:
+            for edge in edges:
+                for peer in [edge.get("from"), edge.get("to")]:
+                    if peer and peer not in ["Unknown_Sender", "Unknown_Receiver"]:
+                        session.run("""
+                            MERGE (n:Wallet {id: $id})
+                            ON CREATE SET n.crypto_type = $crypto_type, n.category = 'Under Investigation',
+                                          n.source_url = 'On-Chain Multi-Hop Forensics', n.timestamp = $ts,
+                                          n.hop_depth = $depth
+                        """, id=peer, crypto_type=crypto_type, 
+                            ts=datetime.utcnow().isoformat(), depth=edge.get("hop_depth", 0))
+                
+                session.run("""
+                    MATCH (a:Wallet {id: $from_id})
+                    MATCH (b:Wallet {id: $to_id})
+                    MERGE (a)-[r:TRANSACTED_WITH {tx_hash: $tx_hash}]->(b)
+                    ON CREATE SET r.amount = $amount, r.hop_depth = $depth
+                """, from_id=edge.get("from"), to_id=edge.get("to"),
+                    tx_hash=edge.get("hash", "unknown"), amount=edge.get("value", 0),
+                    depth=edge.get("hop_depth", 0))
+    
+    return {
+        "wallet": wallet_address,
+        "hops_traced": hops,
+        "transactions_found": len(edges),
+        "unique_wallets": len(set([e.get("from") for e in edges] + [e.get("to") for e in edges])),
+        "edges": edges
+    }
+
+@app.delete("/api/v1/entity/{entity_id}")
+async def delete_entity(entity_id: str):
+    """Deletes a specific node and its associated relationships from Neo4j."""
+    if not driver:
+        raise HTTPException(status_code=500, detail="Neo4j not connected.")
+        
+    with driver.session() as session:
+        # DETACH DELETE removes the node and all connected edges
+        res = session.run("MATCH (n {id: $id}) DETACH DELETE n RETURN count(n) as deleted", id=entity_id)
+        deleted = res.single()["deleted"]
+        
+        if deleted == 0:
+            raise HTTPException(status_code=404, detail="Entity not found.")
+            
+    return {"status": "success", "message": f"Entity {entity_id} deleted."}
+
 @app.delete("/api/v1/flush")
 def flush_data():
     """Wipes all data from Neo4j and LanceDB. Danger zone."""
@@ -817,6 +1025,10 @@ def health_check():
         "lancedb": lancedb_status
     }
 
+@app.get("/api/v1/logs")
+def get_logs():
+    return {"logs": list(live_console.logs)}
+
 class TargetRequest(BaseModel):
     url: str
     type: str
@@ -825,52 +1037,110 @@ class AskRequest(BaseModel):
     query: str
 
 @app.post("/api/v1/ask")
-def ask_ai(payload: AskRequest):
-    query = payload.query.strip()
-    if not query:
-        raise HTTPException(status_code=400, detail="Query cannot be empty.")
+async def ask_intelligence(payload: dict = Body(...)):
+    """Natural language query → Semantic DB + Graph DB → AI Summary."""
+    question = payload.get("query", payload.get("question", ""))
+    
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY_1")
+    if not api_key:
+        return {"error": "No Gemini API Key found for Natural Language conversion", "question": question}
         
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key={api_key}"
+    
+    # 1. Search LanceDB (Semantic / Fuzzy Match)
+    lance_results = []
     try:
-        # 1. Search LanceDB for context
-        context_texts = []
-        if lancedb_client and hf_embeddings:
-            if "scraped_evidence" in lancedb_client.table_names():
-                tbl = lancedb_client.open_table("scraped_evidence")
-                vector = hf_embeddings.embed_query(query)
-                results = tbl.search(vector).limit(3).to_list()
-                for r in results:
-                    context_texts.append(str(r.get("text", "")))
-                    
-        context_str = "\n\n---\n\n".join(context_texts) if context_texts else "No specific evidence found in database."
-        
-        # 2. Call Groq
-        groq_api_key = os.environ.get("GROQ_ASK_AI_KEY")
-        if not groq_api_key:
-            return {"answer": "Groq API key not configured for Semantic Search. Missing GROQ_ASK_AI_KEY."}
-            
-        system_prompt = f"You are CryptoIntel AI. Answer the user's question based ONLY on the evidence below. Keep it concise, analytical, and tactical. If not in the evidence, say so.\n\nEVIDENCE:\n{context_str}"
-        headers = {
-            "Authorization": f"Bearer {groq_api_key}",
-            "Content-Type": "application/json"
-        }
-        data = {
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": query}
-            ],
-            "temperature": 0.1
-        }
-        
-        response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=data)
-        if response.status_code == 200:
-            answer = response.json()["choices"][0]["message"]["content"]
-            return {"answer": answer, "sources": len(context_texts)}
-        else:
-            return {"answer": f"Groq API Error: {response.text}", "sources": 0}
-            
+        if lancedb_client and hf_embeddings and "scraped_evidence" in lancedb_client.table_names():
+            tbl = lancedb_client.open_table("scraped_evidence")
+            vector = hf_embeddings.embed_query(question)
+            records = tbl.search(vector).limit(5).to_list()
+            for r in records:
+                lance_results.append({
+                    "text": str(r.get("text", "")),
+                    "source_url": str(r.get("source_url", "")),
+                    "risk_score": int(r.get("risk_score", 0)) if str(r.get("risk_score")).isdigit() else r.get("risk_score")
+                })
     except Exception as e:
-        return {"answer": f"Error occurred: {str(e)}", "sources": 0}
+        print(f"[LanceDB Ask Error] {e}")
+
+    # 2. Search Neo4j (Graph / Structural Match)
+    prompt = f"""You are a Neo4j Cypher query generator for a crypto intelligence database.
+
+Neo4j Schema:
+- Nodes have labels like: Wallet, Suspect, Exchange, Entity
+- Node properties: id (string), category (string: "Narcotics","Terror Financing","Money Laundering","Cybercrime","Unknown", "Under Investigation"), 
+  score (integer 0-100), crypto_type (string: BTC/ETH/XMR/TRX/etc), 
+  phone (string), email (string), real_name (string), estimated_location (string),
+  source_url (string), sightings_count (integer), tx_count (integer), final_balance (float), desc (string)
+- Relationships: OWNED_BY, TRANSACTED_WITH, LINKED_TO, CORROBORATES
+
+CRITICAL INSTRUCTIONS:
+1. ALWAYS use case-insensitive matching by using toLower(), e.g. `WHERE toLower(n.category) = 'cybercrime'` or `toLower(n.estimated_location) CONTAINS 'russia'`.
+2. When searching for generic topics (like 'ransom' or '0.5 btc'), use `CONTAINS` on the `desc` or `id` fields: `WHERE toLower(n.desc) CONTAINS 'ransom' OR toLower(n.id) CONTAINS 'ransom'`.
+3. Never make up properties like 'status'. Use only the properties listed above.
+
+Convert this question to a Cypher query that returns relevant results.
+Question: {question}
+
+Return ONLY the Cypher query, no explanation, no markdown."""
+
+    cypher = ""
+    neo4j_records = []
+    try:
+        resp = requests.post(url, json={
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.1}
+        })
+        resp.raise_for_status()
+        cypher = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        cypher = cypher.replace("```cypher", "").replace("```", "").strip()
+        
+        if driver:
+            with driver.session() as session:
+                result = session.run(cypher)
+                for record in result:
+                    safe_record = {}
+                    for k, v in record.items():
+                        if hasattr(v, 'labels'):
+                            safe_record[k] = {"labels": list(v.labels), "properties": dict(v)}
+                        elif hasattr(v, 'type'):
+                            safe_record[k] = {"type": v.type, "properties": dict(v)}
+                        else:
+                            safe_record[k] = v
+                    neo4j_records.append(safe_record)
+    except Exception as e:
+        print(f"[Neo4j Ask Error] {e}")
+                
+    nl_summary = "No results found in Graph or Vector databases."
+    if neo4j_records or lance_results:
+        summary_prompt = f"""You are a professional intelligence analyst.
+        I asked you this question: {question}
+        
+        I ran a semantic search on raw intercepted text and found:
+        {json.dumps(lance_results[:5])}
+        
+        I ran a graph database query and found these structured entities/connections:
+        {json.dumps(neo4j_records[:10])}
+        
+        Please write a concise, professional, 1-3 sentence natural language summary of the findings. Do not mention JSON, Cypher, LanceDB, Neo4j, or nodes. Just answer the question directly using the combined data from both sources."""
+        
+        try:
+            summary_resp = requests.post(url, json={
+                "contents": [{"parts": [{"text": summary_prompt}]}],
+                "generationConfig": {"temperature": 0.2}
+            })
+            summary_resp.raise_for_status()
+            nl_summary = summary_resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception as e:
+            nl_summary = "Error generating summary: " + str(e)
+    
+    return {
+        "question": question, 
+        "cypher": cypher, 
+        "graph_results": neo4j_records[:10],
+        "semantic_results": lance_results[:5], 
+        "nl_summary": nl_summary
+    }
 
 @app.get("/api/v1/scraper/targets")
 def get_targets():
@@ -898,5 +1168,4 @@ def delete_target(url: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
-
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=False)

@@ -14,6 +14,8 @@ import { AgentTracesPanel } from "@/components/AgentTracesPanel";
 import { ManualIntelDropPanel } from "@/components/ManualIntelDropPanel";
 import { SystemConfigPanel } from "@/components/SystemConfigPanel";
 import AskAIPanel from "@/components/AskAIPanel";
+import { ThreatMap } from "@/components/ThreatMap";
+import RiskClustersGraph from "@/components/RiskClustersGraph";
 
 const NetworkGraph = dynamic(() => import("@/components/NetworkGraph"), { ssr: false });
 
@@ -36,7 +38,7 @@ function AgentMonitor({ isMinimized, setIsMinimized }: { isMinimized: boolean, s
     
     // Poll every 1 second
     fetchLogs();
-    const timer = setInterval(fetchLogs, 1000);
+    const timer = setInterval(fetchLogs, 3000);
     return () => clearInterval(timer);
   }, []);
 
@@ -49,11 +51,16 @@ function AgentMonitor({ isMinimized, setIsMinimized }: { isMinimized: boolean, s
 
   return (
     <Card className={`border-border/50 bg-black/80 flex flex-col transition-all duration-300 ${isMinimized ? 'h-[60px]' : 'h-[500px]'} overflow-hidden`}>
-      <CardHeader className="pb-3 border-b border-border/30 bg-black/90 flex flex-row items-center justify-between cursor-pointer hover:bg-black/70" onClick={() => setIsMinimized(!isMinimized)}>
-        <CardTitle className="text-sm font-mono text-primary flex items-center gap-2">
-           <TerminalSquare className="w-4 h-4 animate-pulse" /> LIVE SWARM TERMINAL
+      <CardHeader className="pb-3 border-b border-border/30 bg-black/90 flex flex-row items-center justify-between cursor-pointer hover:bg-black/70 relative overflow-hidden" onClick={() => setIsMinimized(!isMinimized)}>
+        <div className="absolute inset-0 opacity-20 pointer-events-none flex items-center justify-end px-10 gap-[2px]">
+          {Array.from({length: 30}).map((_, i) => (
+            <div key={i} className="w-1 bg-cyan-400" style={{ height: '30px', animation: `waveform ${0.5 + Math.random()}s ease-in-out infinite`, animationDelay: `${Math.random()}s` }}></div>
+          ))}
+        </div>
+        <CardTitle className="text-sm font-mono text-primary flex items-center gap-2 relative z-10">
+           <TerminalSquare className="w-4 h-4 animate-pulse" /> <span className="text-gradient-cyan">LIVE SWARM TERMINAL</span>
         </CardTitle>
-        <button className="text-muted-foreground hover:text-foreground">
+        <button className="text-muted-foreground hover:text-foreground relative z-10">
           {isMinimized ? <Maximize2 className="w-4 h-4" /> : <Minimize2 className="w-4 h-4" />}
         </button>
       </CardHeader>
@@ -73,19 +80,101 @@ function AgentMonitor({ isMinimized, setIsMinimized }: { isMinimized: boolean, s
             
             return (
               <div key={i} className={`whitespace-pre-wrap ${textColor}`}>
-                {log}
+                <Typewriter text={log} speed={5} />
               </div>
             );
           })
         )}
+        <div className="text-green-500 animate-pulse mt-1 ml-1">█</div>
       </CardContent>
       )}
     </Card>
   );
 }
 
-export default function Dashboard() {
+function Typewriter({ text, speed = 50 }: { text: string, speed?: number }) {
+  const [displayed, setDisplayed] = useState("");
+  useEffect(() => {
+    setDisplayed("");
+    let i = 0;
+    const interval = setInterval(() => {
+      setDisplayed(text.substring(0, i + 1));
+      i++;
+      if (i >= text.length) clearInterval(interval);
+    }, speed);
+    return () => clearInterval(interval);
+  }, [text, speed]);
+  return <span>{displayed}<span className="animate-pulse opacity-70">_</span></span>;
+}
+
+function GlitchText({ text, duration = 1000 }: { text: string, duration?: number }) {
+  const [displayed, setDisplayed] = useState("");
+  const [isGlitching, setIsGlitching] = useState(true);
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_+";
+  
+  useEffect(() => {
+    let interval: NodeJS.Timeout;
+    if (isGlitching) {
+      interval = setInterval(() => {
+        setDisplayed(text.split('').map(c => Math.random() > 0.5 ? chars[Math.floor(Math.random() * chars.length)] : c).join(''));
+      }, 50);
+      setTimeout(() => {
+        setIsGlitching(false);
+        setDisplayed(text);
+        clearInterval(interval);
+      }, duration);
+    } else {
+      setDisplayed(text);
+    }
+    return () => clearInterval(interval);
+  }, [text, duration, isGlitching]);
+  
+  return <span className={isGlitching ? "font-mono font-bold" : ""}>{displayed}</span>;
+}
+
+function CountUp({ end, duration = 1500 }: { end: number, duration?: number }) {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    let startTimestamp: number | null = null;
+    const step = (timestamp: number) => {
+      if (!startTimestamp) startTimestamp = timestamp;
+      const progress = Math.min((timestamp - startTimestamp) / duration, 1);
+      const ease = progress === 1 ? 1 : 1 - Math.pow(2, -10 * progress);
+      setCount(Math.floor(ease * end));
+      if (progress < 1) {
+        window.requestAnimationFrame(step);
+      } else {
+        setCount(end);
+      }
+    };
+    window.requestAnimationFrame(step);
+  }, [end, duration]);
+  return <span>{count}</span>;
+}
+
+function Dashboard() {
   const [activeTab, setActiveTab] = useState("Intelligence Graph");
+  const [isBackendStarting, setIsBackendStarting] = useState(true);
+  const [isTransitioning, setIsTransitioning] = useState(false);
+  const [targetTab, setTargetTab] = useState("");
+  
+  // Health polling
+  useEffect(() => {
+    const checkHealth = async () => {
+      try {
+        const res = await fetch("/api/v1/health");
+        if (res.ok) {
+           setIsBackendStarting(false);
+        }
+      } catch (e) {
+        // Backend not ready
+      }
+    };
+    checkHealth();
+    const timer = setInterval(checkHealth, 2000);
+    return () => clearInterval(timer);
+  }, []);
+  
   const [nodes, setNodes] = useState<any[]>([]);
   const [edges, setEdges] = useState<any[]>([]);
   const [selectedNode, setSelectedNode] = useState<any | null>(null);
@@ -112,6 +201,7 @@ export default function Dashboard() {
   const [selectedCategory, setSelectedCategory] = useState("All Categories");
   const [searchQuery, setSearchQuery] = useState("");
   const [recenterTrigger, setRecenterTrigger] = useState(0);
+  const [forceRefreshTrigger, setForceRefreshTrigger] = useState(0);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -145,35 +235,86 @@ export default function Dashboard() {
              }
           }
           
-          // Global High Risk Alert Logic
-          const highRisk = allNodes
-            .filter((n: any) => (n.properties?.score || 0) >= 70 || n.properties?.category === "Terror Financing")
-            .map((n: any) => n.properties);
-            
+          // Check for high risk alerts
           if (initialLoadDone.current) {
-            const newAlerts = highRisk.filter((a: any) => !seenIds.current.has(a.id));
-            if (newAlerts.length > 0) {
-              newAlerts.forEach((a: any) => {
-                const toastId = Math.random().toString(36).substring(7);
-                setActiveToasts(prev => [...prev, { ...a, toastId }]);
-                setTimeout(() => {
-                  setActiveToasts(prev => prev.filter(t => t.toastId !== toastId));
-                }, 8000);
-              });
+            const newHighRisk = allNodes.filter((n: any) => {
+              const id = n.properties?.id;
+              const isHighRisk = (n.properties?.score || 0) > 80 || n.properties?.category === "Terror Financing";
+              if (isHighRisk && !seenIds.current.has(id)) {
+                seenIds.current.add(id);
+                return true;
+              }
+              return false;
+            });
+            
+            if (newHighRisk.length > 0) {
+              const newToasts = newHighRisk.map((n: any) => ({
+                id: n.properties?.id,
+                score: n.properties?.score || 0,
+                category: n.properties?.category,
+                toastId: Math.random().toString(36).substring(7)
+              }));
+              setActiveToasts(prev => [...prev, ...newToasts]);
+              
+              // auto remove toasts after 5s
+              setTimeout(() => {
+                setActiveToasts(prev => prev.filter(t => !newToasts.find((nt: any) => nt.toastId === t.toastId)));
+              }, 5000);
             }
+          } else {
+            allNodes.forEach((n: any) => seenIds.current.add(n.properties?.id));
+            initialLoadDone.current = true;
           }
-          
-          highRisk.forEach((a: any) => seenIds.current.add(a.id));
-          initialLoadDone.current = true;
         }
-      } catch (err) {
-        console.error("Failed to fetch graph data", err);
+      } catch (e) {
+        console.error("Failed to fetch graph data", e);
       }
     };
     
     fetchData();
-    const interval = setInterval(fetchData, 5000); // Live poll every 5s
+    const interval = setInterval(fetchData, 15000);
     return () => clearInterval(interval);
+  }, [forceRefreshTrigger]);
+
+  // Demo Mode triggers
+  useEffect(() => {
+    const handleKeyDown = async (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'd') {
+         e.preventDefault();
+         const toastId = Math.random().toString(36).substring(7);
+         setActiveToasts(prev => [...prev, { 
+             id: "DEMO_MODE", category: "System", score: 100,
+             desc: "LIVE INVESTIGATION TRIGGERED: Fanning out OSINT agents...",
+             toastId 
+         }]);
+         setTimeout(() => setActiveToasts(prev => prev.filter(t => t.toastId !== toastId)), 5000);
+         
+         // Payload 1
+         await fetch("/api/v1/investigate", {
+           method: "POST",
+           headers: { "Content-Type": "application/json" },
+           body: JSON.stringify({
+             raw_text: "High priority threat detection. Telegram channel 'DarkNet_Ops' discovered. Wallet 149w62rY42aZXBydCcKtcK9Xy4vUoGvtzr linked to admin alias 'ShadowBroker99'. Suspected terrorist financing ring based in Damascus, Syria.",
+             source_url: "https://t.me/DarkNet_Ops"
+           })
+         });
+         
+         setTimeout(async () => {
+             // Payload 2
+             await fetch("/api/v1/investigate", {
+               method: "POST",
+               headers: { "Content-Type": "application/json" },
+               body: JSON.stringify({
+                 raw_text: "Corroborating evidence from Pastebin dump. Alias 'ShadowBroker99' operates wallet 149w62rY42aZXBydCcKtcK9Xy4vUoGvtzr. Direct email found: shadow.broker@protonmail.ch. Seeking crypto launderer for $5M transfer.",
+                 source_url: "https://pastebin.com/raw/shadow99"
+               })
+             });
+         }, 5000);
+      }
+    };
+    
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
   // Playback loop
@@ -257,8 +398,38 @@ export default function Dashboard() {
   const filteredNodeIds = new Set(filteredNodes.map(n => n.properties?.id));
   const filteredEdges = edges.filter(e => filteredNodeIds.has(e.source) && filteredNodeIds.has(e.target));
 
+  if (isBackendStarting || isTransitioning) {
+    return (
+      <div className="flex flex-col items-center justify-center w-full h-screen bg-transparent text-foreground selection:bg-primary/30">
+        <style>{`
+          @keyframes spinY {
+            0% { transform: rotateY(0deg); }
+            100% { transform: rotateY(360deg); }
+          }
+        `}</style>
+        <div className="relative flex flex-col items-center justify-center h-64 mb-8">
+            <div className="absolute inset-0 bg-primary/20 blur-[60px] rounded-full w-48 h-48 m-auto animate-pulse" />
+            <img 
+              src="/logo.png" 
+              alt="CryptoIntel Logo" 
+              className="w-48 h-48 mix-blend-screen relative z-10" 
+              style={{ animation: 'spinY 3s ease-in-out infinite' }} 
+            />
+        </div>
+        <div className="h-16 flex flex-col items-center">
+            <h2 className="text-xl sm:text-2xl font-mono text-primary tracking-widest uppercase">
+              <Typewriter text={isTransitioning ? "ACCESSING NEURAL SECTOR..." : "INITIALIZING CRYPTOINTEL SYSTEM..."} speed={60} />
+            </h2>
+            <p className="text-sm text-muted-foreground mt-4 font-mono">
+              <Typewriter text={isTransitioning ? `Establishing secure link to [${targetTab}]` : "Connecting to Swarm Backend & Neural DBs"} speed={40} />
+            </p>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="flex h-screen bg-background overflow-hidden selection:bg-primary/30">
+    <div className="flex h-screen bg-transparent overflow-hidden selection:bg-primary/30">
       {/* GLOBAL TOAST CONTAINER */}
       <div className="fixed top-6 left-1/2 -translate-x-1/2 z-[200] flex flex-col items-center gap-3 pointer-events-none">
         {activeToasts.map(toast => (
@@ -280,34 +451,64 @@ export default function Dashboard() {
       </div>
 
       {/* Sidebar */}
-      <Sidebar activeTab={activeTab} onTabChange={setActiveTab} />
+      <Sidebar 
+        activeTab={activeTab} 
+        onTabChange={(tab) => {
+          if (tab === activeTab) return;
+          setTargetTab(tab);
+          setIsTransitioning(true);
+          setTimeout(() => {
+            setActiveTab(tab);
+            setIsTransitioning(false);
+          }, 1000);
+        }} 
+        alertCount={nodes.filter(n => (n.properties?.score || 0) > 50 || n.properties?.category === "Terror Financing").length} 
+      />
       
       <main className="flex-1 overflow-y-auto p-8 relative flex flex-col">
         {activeTab === "Intelligence Graph" ? (
           <>
-            {selectedNode && (
-               <DossierPanel 
-                 node={selectedNode.properties || selectedNode} 
-                 edges={filteredEdges} 
-                 onClose={() => setSelectedNode(null)} 
-               />
-            )}
+            <div className="absolute top-4 right-4 z-20 flex gap-2">
+            <button 
+              onClick={() => setIsGraphFullscreen(!isGraphFullscreen)}
+              className="bg-black/60 p-2 rounded-md border border-border/50 text-muted-foreground hover:text-white hover:bg-black/80 transition-colors"
+              title="Toggle Fullscreen"
+            >
+              {isGraphFullscreen ? <Minimize2 className="w-5 h-5" /> : <Maximize2 className="w-5 h-5" />}
+            </button>
+          </div>
+
+          {selectedNode && (
+            <DossierPanel 
+              node={selectedNode} 
+              edges={edges}
+              onClose={() => setSelectedNode(null)}
+              onTraceComplete={() => setForceRefreshTrigger(prev => prev + 1)}
+            />
+          )}
+          
+            {/* CLASSIFIED TICKER */}
+            <div className="w-full bg-black/60 border-b border-border/50 py-0.5 overflow-hidden sticky top-0 z-[100] mb-4">
+              <div className="whitespace-nowrap font-mono text-[10px] text-red-500/60 tracking-[0.2em] font-bold" style={{ animation: 'ticker 20s linear infinite' }}>
+                // CLASSIFIED — LEVEL 4 CLEARANCE — CRYPTOINTEL AUTONOMOUS CORE v2.0 // CLASSIFIED — LEVEL 4 CLEARANCE — CRYPTOINTEL AUTONOMOUS CORE v2.0 // CLASSIFIED — LEVEL 4 CLEARANCE — CRYPTOINTEL AUTONOMOUS CORE v2.0 // CLASSIFIED — LEVEL 4 CLEARANCE — CRYPTOINTEL AUTONOMOUS CORE v2.0 //
+              </div>
+            </div>
             <header className="mb-6 flex flex-col xl:flex-row xl:items-start justify-between gap-4 border-b border-border/50 pb-4">
               <div className="flex flex-col gap-3 flex-1 w-full max-w-2xl">
-                <div className="relative flex-1">
+                <div className="relative flex-1 search-bloom">
                   <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
                   <input 
                     type="text" 
                     placeholder="Global Search (Wallet, Name, Phone, Email...)" 
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
-                    className="w-full bg-background border border-border/50 rounded-md pl-10 pr-4 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-primary shadow-sm"
+                    className="w-full bg-background/50 border border-border/50 rounded-md pl-10 pr-4 py-2 text-sm focus:outline-none focus:ring-1 focus:ring-primary shadow-sm backdrop-blur-sm"
                   />
                 </div>
                 <div className="flex items-center text-xs text-muted-foreground gap-2">
                   <Radio className="w-3 h-3 text-green-400 animate-pulse shrink-0" />
-                  <span className="font-mono bg-black/30 px-2 py-0.5 rounded border border-border/50 truncate">
-                    Live Ticker // Last extraction: {timeSinceLastExt} - Target: Pastebin Asset Drop
+                  <span className="font-mono bg-black/30 px-2 py-0.5 rounded border border-border/50 truncate flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse shadow-[0_0_12px_#63eba9]" /> LIVE // Last extraction: {timeSinceLastExt} - Target: Pastebin Asset Drop
                   </span>
                 </div>
               </div>
@@ -339,83 +540,10 @@ export default function Dashboard() {
             </header>
 
             {/* KPI Stats Row Toggle */}
-            <div className="mb-4 flex items-center justify-between">
-               <button onClick={() => setShowKpiStats(!showKpiStats)} className="text-xs font-mono font-medium text-muted-foreground hover:text-foreground flex items-center gap-2 px-3 py-1.5 rounded-md bg-secondary/30 hover:bg-secondary/60 transition-colors border border-border/50">
-                 {showKpiStats ? <Shrink className="w-3.5 h-3.5" /> : <Expand className="w-3.5 h-3.5" />}
-                 {showKpiStats ? "HIDE KPI DASHBOARD" : "SHOW KPI DASHBOARD"}
-               </button>
+            {/* Live Swarm Terminal */}
+            <div className="mb-6 w-full">
+               <AgentMonitor isMinimized={isTerminalMinimized} setIsMinimized={setIsTerminalMinimized} />
             </div>
-
-            {showKpiStats && (
-            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-6 animate-in fade-in slide-in-from-top-4 duration-300">
-              <Card className="bg-card/40 border-border/50">
-                <CardContent className="p-4 flex flex-col justify-center">
-                  <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-1">Total Entities</div>
-                  <div className="text-2xl font-bold">{filteredNodes.length}</div>
-                </CardContent>
-              </Card>
-              <Card className="bg-card/40 border-border/50">
-                <CardContent className="p-4 flex flex-col justify-center">
-                  <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-1">High Risk Alerts</div>
-                  <div className="text-2xl font-bold text-destructive animate-pulse flex items-center gap-2">
-                    <ShieldAlert className="w-5 h-5" />
-                    {filteredNodes.filter(n => (n.properties?.score || 0) > 50).length}
-                  </div>
-                </CardContent>
-              </Card>
-              <Card className="bg-card/40 border-border/50">
-                <CardContent className="p-4 flex flex-col justify-center">
-                  <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-1">Unique Suspects</div>
-                  <div className="text-2xl font-bold text-primary">
-                    {filteredNodes.filter(n => n.properties?.type === "Suspect").length}
-                  </div>
-                </CardContent>
-              </Card>
-              <Card className="bg-card/40 border-border/50">
-                <CardContent className="p-4 flex flex-col justify-center">
-                  <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-1">Crypto Addresses</div>
-                  <div className="text-2xl font-bold text-green-400">
-                    {filteredNodes.filter(n => n.properties?.type === "Wallet").length}
-                  </div>
-                </CardContent>
-              </Card>
-              <Card className="bg-card/40 border-border/50">
-                <CardContent className="p-4 flex flex-col justify-center">
-                  <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-1">Connected Graph Edges</div>
-                  <div className="text-2xl font-bold text-accent">{filteredEdges.length}</div>
-                </CardContent>
-              </Card>
-              
-              {/* Timeline Heatmap */}
-              <Card className="bg-card/40 border-border/50">
-                <CardContent className="p-4 flex flex-col justify-center h-full">
-                  <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-2">Activity Heatmap (7 Days)</div>
-                  <div className="flex items-center gap-1 h-8">
-                    {[6, 5, 4, 3, 2, 1, 0].map(dayOffset => {
-                       const targetDate = new Date();
-                       targetDate.setDate(targetDate.getDate() - dayOffset);
-                       const dateString = targetDate.toISOString().split('T')[0];
-                       
-                       const count = filteredNodes.filter(n => {
-                          const ts = n.properties?.last_seen || n.properties?.timestamp;
-                          if (!ts) return false;
-                          return ts.startsWith(dateString);
-                       }).length;
-                       
-                       let intensity = "bg-secondary";
-                       if (count > 0 && count < 3) intensity = "bg-primary/40";
-                       else if (count >= 3 && count < 10) intensity = "bg-primary/70";
-                       else if (count >= 10) intensity = "bg-primary";
-                       
-                       return (
-                         <div key={dayOffset} className={`flex-1 h-full rounded-sm ${intensity} transition-all hover:ring-1 hover:ring-primary`} title={`${dateString}: ${count} entities`} />
-                       );
-                    })}
-                  </div>
-                </CardContent>
-              </Card>
-            </div>
-            )}
 
             {/* Filter Bar */}
             <div className="mb-6 bg-card/40 border border-border/50 rounded-lg p-4 flex flex-col md:flex-row items-center gap-6">
@@ -467,18 +595,102 @@ export default function Dashboard() {
                 </div>
             </div>
 
-            {/* Main Graph & Agent Monitor Split */}
-            <div className={`flex flex-col lg:flex-row gap-6 mb-6 ${isTerminalMinimized ? 'items-start' : ''}`}>
-               <div className={`transition-all duration-300 ${isTerminalMinimized ? 'lg:w-[300px]' : 'lg:w-1/3'} flex-shrink-0`}>
-                  <AgentMonitor isMinimized={isTerminalMinimized} setIsMinimized={setIsTerminalMinimized} />
+            {/* Main Graph & KPI Stats Split */}
+            <div className={`flex flex-col lg:flex-row-reverse gap-6 mb-6 ${!showKpiStats ? 'items-start' : ''}`}>
+               <div className={`transition-all duration-300 ${!showKpiStats ? 'lg:w-[300px]' : 'lg:w-1/3'} flex-shrink-0 flex flex-col gap-4`}>
+                 <div className="flex items-center justify-between bg-black/40 border border-border/50 p-2 rounded-md">
+                   <button onClick={() => setShowKpiStats(!showKpiStats)} className="text-xs font-mono font-medium text-muted-foreground hover:text-foreground flex items-center gap-2 px-3 py-1.5 rounded-md bg-secondary/30 hover:bg-secondary/60 transition-colors w-full justify-center">
+                     {showKpiStats ? <Shrink className="w-3.5 h-3.5" /> : <Expand className="w-3.5 h-3.5" />}
+                     {showKpiStats ? "HIDE KPI DASHBOARD" : "SHOW KPI DASHBOARD"}
+                   </button>
+                 </div>
+                 
+                 {showKpiStats && (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 animate-in fade-in slide-in-from-left-4 duration-300 overflow-y-auto max-h-[500px] pr-2">
+                    <Card className="bg-card/40 border-border/50 card-cinematic">
+                      <CardContent className="p-4 flex flex-col justify-center">
+                        <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-1">Total Entities</div>
+                        <div className="text-2xl font-bold"><CountUp end={filteredNodes.length} /></div>
+                      </CardContent>
+                    </Card>
+                    <Card className="bg-card/40 border-border/50 card-cinematic relative overflow-hidden">
+                      <CardContent className="p-4 flex items-center justify-between gap-4">
+                        <div className="flex flex-col">
+                          <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-1">High Risk Alerts</div>
+                          <div className="text-3xl font-bold text-destructive">
+                            <CountUp end={filteredNodes.filter(n => (n.properties?.score || 0) > 50).length} />
+                          </div>
+                        </div>
+                        <div className="relative w-14 h-14 flex items-center justify-center shrink-0">
+                          <svg className="absolute inset-0 w-full h-full -rotate-90">
+                            <circle cx="28" cy="28" r="24" stroke="currentColor" strokeWidth="3" fill="transparent" className="text-destructive/20" />
+                            <circle cx="28" cy="28" r="24" stroke="currentColor" strokeWidth="3" fill="transparent" strokeDasharray="150" strokeDashoffset="40" className="text-destructive transition-all duration-1000 ease-out" />
+                          </svg>
+                          <ShieldAlert className="w-5 h-5 text-destructive absolute animate-pulse" />
+                        </div>
+                      </CardContent>
+                    </Card>
+                    <Card className="bg-card/40 border-border/50 card-cinematic">
+                      <CardContent className="p-4 flex flex-col justify-center">
+                        <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-1">Unique Suspects</div>
+                        <div className="text-2xl font-bold text-primary">
+                          <CountUp end={filteredNodes.filter(n => n.properties?.type === "Suspect").length} />
+                        </div>
+                      </CardContent>
+                    </Card>
+                    <Card className="bg-card/40 border-border/50 card-cinematic">
+                      <CardContent className="p-4 flex flex-col justify-center">
+                        <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-1">Crypto Addresses</div>
+                        <div className="text-2xl font-bold text-green-400">
+                          <CountUp end={filteredNodes.filter(n => n.properties?.type === "Wallet").length} />
+                        </div>
+                      </CardContent>
+                    </Card>
+                    <Card className="bg-card/40 border-border/50 card-cinematic">
+                      <CardContent className="p-4 flex flex-col justify-center">
+                        <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-1">Connected Graph Edges</div>
+                        <div className="text-2xl font-bold text-accent"><CountUp end={filteredEdges.length} /></div>
+                      </CardContent>
+                    </Card>
+                    
+                    {/* Timeline Heatmap */}
+                    <Card className="bg-card/40 border-border/50 sm:col-span-2">
+                      <CardContent className="p-4 flex flex-col justify-center h-full">
+                        <div className="text-muted-foreground text-xs font-bold tracking-widest uppercase mb-2">Activity Heatmap (7 Days)</div>
+                        <div className="flex items-center gap-1 h-8">
+                          {[6, 5, 4, 3, 2, 1, 0].map(dayOffset => {
+                             const targetDate = new Date();
+                             targetDate.setDate(targetDate.getDate() - dayOffset);
+                             const dateString = targetDate.toISOString().split('T')[0];
+                             
+                             const count = filteredNodes.filter(n => {
+                                const ts = n.properties?.last_seen || n.properties?.timestamp;
+                                if (!ts) return false;
+                                return ts.startsWith(dateString);
+                             }).length;
+                             
+                             let intensity = "bg-secondary";
+                             if (count > 0 && count < 3) intensity = "bg-primary/40";
+                             else if (count >= 3 && count < 10) intensity = "bg-primary/70";
+                             else if (count >= 10) intensity = "bg-primary";
+                             
+                             return (
+                               <div key={dayOffset} className={`flex-1 h-full rounded-sm ${intensity} transition-all hover:ring-1 hover:ring-primary`} title={`${dateString}: ${count} entities`} />
+                             );
+                          })}
+                        </div>
+                      </CardContent>
+                    </Card>
+                  </div>
+                 )}
                </div>
-               <Card className={`border-border/50 flex flex-col overflow-hidden transition-all duration-300 ${isGraphFullscreen ? 'fixed inset-4 z-50 bg-black shadow-2xl rounded-xl h-[calc(100vh-2rem)] border-primary/50' : (isGraphMinimized ? 'bg-card/40 flex-1 h-[60px]' : 'bg-card/40 flex-1 h-[500px]')}`}>
+               <Card className={`border-border/50 flex flex-col overflow-hidden transition-all duration-300 ${isGraphFullscreen ? 'fixed inset-4 z-50 bg-black shadow-2xl rounded-xl h-[calc(100vh-2rem)] border-primary/50' : (isGraphMinimized ? 'bg-card/40 flex-1 h-[60px]' : 'bg-card/40 flex-1 h-[500px]')} ${selectedNode && (selectedNode.properties?.score || 0) > 60 ? 'ambient-red-glow' : 'bg-vignette'}`}>
                  <CardHeader className="pb-3 border-b border-border/30 bg-black/20 flex flex-row items-center justify-between cursor-pointer hover:bg-black/30" onClick={(e) => {
                    if ((e.target as HTMLElement).closest('.controls-btn')) return;
                    if (!isGraphFullscreen) setIsGraphMinimized(!isGraphMinimized);
                  }}>
                    <CardTitle className="flex justify-between items-center text-lg w-full">
-                     <span className="flex items-center gap-2"><Network className="w-5 h-5 text-primary" /> INTERACTIVE NETWORK MAP</span>
+                     <span className="flex items-center gap-2 text-gradient-cyan"><Network className="w-5 h-5 text-primary" /> INTERACTIVE NETWORK MAP</span>
                      <div className="flex items-center gap-4">
                        <Badge variant="outline" className="font-mono text-xs text-muted-foreground bg-background/50 hidden sm:flex">
                          Neo4j Engine // Click Node for Dossier
@@ -621,7 +833,7 @@ export default function Dashboard() {
             {/* Live Intelligence Feed Table */}
             <Card className="border-border/50 bg-card/40 flex flex-col min-h-[400px]">
               <CardHeader className="pb-3 border-b border-border/30 bg-black/20">
-                <CardTitle className="text-lg flex items-center gap-2">LIVE INTELLIGENCE FEED & WALLET REGISTRY</CardTitle>
+                <CardTitle className="text-lg flex items-center gap-2 text-gradient-cyan">LIVE INTELLIGENCE FEED & WALLET REGISTRY</CardTitle>
               </CardHeader>
               <CardContent className="flex-1 p-0 overflow-auto max-h-[500px]">
                 <Table>
@@ -645,7 +857,24 @@ export default function Dashboard() {
                       const hasBank = desc.includes("bank") || desc.includes("fiat");
                       
                       return (
-                      <TableRow key={i} className="border-border/50 hover:bg-secondary/40 transition-colors cursor-pointer" onClick={() => setSelectedNode(row)}>
+                      <TableRow 
+                        key={`${row.properties?.id || 'row'}-${i}`} 
+                        className={`cursor-pointer hover:bg-secondary/40 transition-colors animate-row-enter ${selectedNode?.id === row.properties?.id ? 'bg-primary/20 animate-row-flash' : ''}`}
+                        style={{ 
+                          animationDelay: `${i * 30}ms`,
+                          boxShadow: (row.properties?.score || 0) > 60 ? 'inset 4px 0 0 #ff5e67' : (row.properties?.score || 0) > 30 ? 'inset 4px 0 0 #f1c15c' : 'inset 4px 0 0 #63eba9' 
+                        }}
+                        onClick={() => {
+                          if (fgRef.current && row.properties?.id) {
+                             const nodeObj = nodes.find(n => n.properties.id === row.properties.id);
+                             if (nodeObj) {
+                                fgRef.current.centerAt(nodeObj.x || 0, nodeObj.y || 0, 1000);
+                                fgRef.current.zoom(2.5, 1000);
+                             }
+                          }
+                          setSelectedNode(row.properties);
+                        }}
+                      >
                         <TableCell className="font-mono text-xs max-w-[200px] truncate px-4 py-3" title={row.properties?.id}>{row.properties?.id}</TableCell>
                         <TableCell className="px-4 py-3">
                           <Badge variant="outline" className={`text-xs whitespace-nowrap bg-blue-500/10 text-blue-400 border-blue-500/50`}>
@@ -706,6 +935,10 @@ export default function Dashboard() {
           <LiveScraperPanel globalNodes={nodes} globalEdges={edges} />
         ) : activeTab === "Manual Intel Drop" ? (
           <ManualIntelDropPanel />
+        ) : activeTab === "Threat Map" ? (
+          <ThreatMap nodes={nodes} />
+        ) : activeTab === "Risk Clusters" ? (
+          <RiskClustersGraph nodes={filteredNodes} edges={filteredEdges} />
         ) : activeTab === "Ask AI Search" ? (
           <AskAIPanel />
         ) : activeTab === "Risk Alerts" ? (
@@ -738,3 +971,5 @@ function getCategoryColor(category?: string) {
     default: return "text-muted-foreground border-border/50 bg-secondary/50";
   }
 }
+
+export default dynamic(() => Promise.resolve(Dashboard), { ssr: false });

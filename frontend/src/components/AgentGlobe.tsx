@@ -73,67 +73,72 @@ export function AgentGlobe({
     { lat: 59.4370, lng: 24.7536, name: "Tallinn" }
   ];
 
-  // Specific Regional Mapping for Linguistic Forensics 
   const REGION_MAP: Record<string, {lat: number, lng: number}> = {
+    "moscow": { lat: 55.7558, lng: 37.6173 },
+    "saint petersburg": { lat: 59.9386, lng: 30.3141 },
+    "netherlands": { lat: 52.1326, lng: 5.2913 },
+    "south korea": { lat: 37.5665, lng: 126.9780 },
     "india": { lat: 20.5937, lng: 78.9629 },
-    "russia": { lat: 61.5240, lng: 105.3188 },
-    "uk": { lat: 55.3781, lng: -3.4360 },
-    "united kingdom": { lat: 55.3781, lng: -3.4360 },
-    "usa": { lat: 37.0902, lng: -95.7129 },
-    "united states": { lat: 37.0902, lng: -95.7129 },
-    "china": { lat: 35.8617, lng: 104.1954 },
+    "russia": { lat: 55.7558, lng: 37.6173 }, // Center on Moscow for visibility
+    "uk": { lat: 51.5074, lng: -0.1278 },
+    "united kingdom": { lat: 51.5074, lng: -0.1278 },
+    "usa": { lat: 38.9072, lng: -77.0369 },
+    "united states": { lat: 38.9072, lng: -77.0369 },
+    "china": { lat: 39.9042, lng: 116.4074 },
     "nigeria": { lat: 9.0820, lng: 8.6753 },
-    "north korea": { lat: 40.3399, lng: 127.5101 },
+    "north korea": { lat: 39.0392, lng: 125.7625 },
     "eastern europe": { lat: 49.0, lng: 31.0 },
     "middle east": { lat: 29.2985, lng: 42.5510 },
     "latin america": { lat: -15.0, lng: -60.0 },
     "southeast asia": { lat: 5.0, lng: 110.0 }
   };
 
-  const labelsData = (globalNodes.length > 0 ? globalNodes : evidence).map(item => {
-     // Neo4j node uses item.properties?.id, evidence uses item.id
-     const str = item.properties?.id || item.id || item.source_url || "";
-     if (!str) return null;
-     
-     const riskScore = item.properties?.score || item.risk_score || 0;
-     const estimatedLocation = (item.properties?.estimated_location || "").toLowerCase();
-     const h1 = getHash(str);
-     
-     // Base coordinates (fallback to cyber hub proxy)
-     let finalLat = CYBER_HUBS[Math.abs(h1) % CYBER_HUBS.length].lat;
-     let finalLng = CYBER_HUBS[Math.abs(h1) % CYBER_HUBS.length].lng;
-     let isEstimated = false;
+  const labelsData = React.useMemo(() => {
+    return (globalNodes.length > 0 ? globalNodes : evidence).map(item => {
+       // Neo4j node uses item.properties?.id, evidence uses item.id
+       const str = item.properties?.id || item.id || item.source_url || "";
+       if (!str) return null;
+       
+       const riskScore = item.properties?.score || item.risk_score || 0;
+       const estimatedLocation = (item.properties?.estimated_location || "").toLowerCase();
+       const h1 = getHash(str);
+       
+       // Base coordinates (fallback to cyber hub proxy)
+       let finalLat = CYBER_HUBS[Math.abs(h1) % CYBER_HUBS.length].lat;
+       let finalLng = CYBER_HUBS[Math.abs(h1) % CYBER_HUBS.length].lng;
+       let isEstimated = false;
 
-     // Attempt to map the Linguistic Forensics estimated location
-     if (estimatedLocation && estimatedLocation !== "unknown") {
-        for (const [key, coords] of Object.entries(REGION_MAP)) {
-           if (estimatedLocation.includes(key)) {
-              finalLat = coords.lat;
-              finalLng = coords.lng;
-              isEstimated = true;
-              break;
-           }
-        }
-     }
-     
-     // Add a tiny bit of random jitter so multiple nodes at the same hub don't perfectly overlap
-     const jitterLat = (Math.abs(getHash(str + "lat")) % 100) / 100 - 0.5;
-     const jitterLng = (Math.abs(getHash(str + "lng")) % 100) / 100 - 0.5;
-     
-     return {
-        id: str,
-        lat: finalLat + (isEstimated ? jitterLat * 3 : jitterLat), // slightly wider jitter for countries
-        lng: finalLng + (isEstimated ? jitterLng * 3 : jitterLng),
-        text: isEstimated ? `${str.split('/').pop()?.substring(0,10)} [${estimatedLocation.toUpperCase()}]` : str.split('/').pop()?.substring(0,15) || "Node",
-        color: riskScore >= 70 ? '#ef4444' : '#10b981',
-        size: riskScore >= 70 ? 1.5 : 0.8
-     };
-  }).filter(Boolean);
+       // Attempt to map the Linguistic Forensics estimated location
+       if (estimatedLocation && estimatedLocation !== "unknown") {
+          for (const [key, coords] of Object.entries(REGION_MAP)) {
+             if (estimatedLocation.includes(key)) {
+                finalLat = coords.lat;
+                finalLng = coords.lng;
+                isEstimated = true;
+                break;
+             }
+          }
+       }
+       
+       // Add a tiny bit of random jitter so multiple nodes at the same hub don't perfectly overlap
+       const jitterLat = (Math.abs(getHash(str + "lat")) % 100) / 100 - 0.5;
+       const jitterLng = (Math.abs(getHash(str + "lng")) % 100) / 100 - 0.5;
+       
+       return {
+          id: str,
+          lat: finalLat + (isEstimated ? jitterLat * 3 : jitterLat), // slightly wider jitter for countries
+          lng: finalLng + (isEstimated ? jitterLng * 3 : jitterLng),
+          text: riskScore >= 50 ? (isEstimated ? `${str.split('/').pop()?.substring(0,10)} [${estimatedLocation.toUpperCase()}]` : str.split('/').pop()?.substring(0,15) || "Node") : "",
+          color: riskScore >= 70 ? '#ef4444' : '#10b981',
+          size: riskScore >= 70 ? 1.5 : 0.8
+       };
+    }).filter(Boolean);
+  }, [globalNodes, evidence]);
 
   useEffect(() => {
-    // If we have real Neo4j edges, map those directly
+    // If we have real Neo4j edges, map those directly (Limit to 150 to save GPU)
     if (globalEdges.length > 0 && labelsData.length > 1) {
-       const arcs = globalEdges.map(edge => {
+       const arcs = globalEdges.slice(0, 150).map(edge => {
          const sourceId = edge.start || edge.startNodeElementId || (edge.source || edge.source?.id);
          const targetId = edge.end || edge.endNodeElementId || (edge.target || edge.target?.id);
          
@@ -146,7 +151,10 @@ export function AgentGlobe({
              startLng: source.lng,
              endLat: target.lat,
              endLng: target.lng,
-             color: '#ef4444' // bright red for actual transactions
+             color: '#ef4444', // bright red for actual transactions
+             dashLength: Math.random() * 0.5 + 0.1,
+             dashGap: Math.random() * 0.5 + 0.1,
+             animateTime: Math.random() * 4000 + 1000
            };
          }
          return null;
@@ -181,15 +189,16 @@ export function AgentGlobe({
            startLng: source.lng,
            endLat: target.lat,
            endLng: target.lng,
-           color: ['#ef4444', '#f87171', '#b91c1c'][Math.floor(Math.random() * 3)]
+           color: ['#ef4444', '#f87171', '#b91c1c'][Math.floor(Math.random() * 3)],
+           dashLength: Math.random() * 0.5 + 0.1,
+           dashGap: Math.random() * 0.5 + 0.1,
+           animateTime: Math.random() * 4000 + 1000
          });
        }
        return arcs;
     };
 
     setArcsData(genArcs());
-    const interval = setInterval(() => setArcsData(genArcs()), 4000);
-    return () => clearInterval(interval);
   }, [labelsData.length, globalEdges]);
 
   useEffect(() => {
@@ -227,21 +236,21 @@ export function AgentGlobe({
           ref={globeRef}
           globeImageUrl={globeMode === "dark" ? "//unpkg.com/three-globe/example/img/earth-dark.jpg" : "//unpkg.com/three-globe/example/img/earth-blue-marble.jpg"}
           bumpImageUrl="//unpkg.com/three-globe/example/img/earth-topology.png"
-          backgroundImageUrl={globeMode === "dark" ? "//unpkg.com/three-globe/example/img/night-sky.png" : ""}
+          backgroundImageUrl="//unpkg.com/three-globe/example/img/night-sky.png"
           showAtmosphere={true}
           atmosphereColor={globeMode === "dark" ? "lightskyblue" : "white"}
           atmosphereAltitude={0.15}
           arcsData={arcsData}
           arcColor="color"
-          arcDashLength={() => Math.random()}
-          arcDashGap={() => Math.random()}
-          arcDashAnimateTime={() => Math.random() * 4000 + 500}
+          arcDashLength={d => (d as any).dashLength || 0.4}
+          arcDashGap={d => (d as any).dashGap || 0.2}
+          arcDashAnimateTime={d => (d as any).animateTime || 2000}
           labelsData={labelsData}
           labelLat={d => (d as any).lat}
           labelLng={d => (d as any).lng}
           labelText={d => (d as any).text}
-          labelSize={d => (d as any).size}
-          labelDotRadius={d => (d as any).size / 2}
+          labelSize={d => (d as any).size * 1.5}
+          labelDotRadius={d => (d as any).size * 1.5}
           labelColor={d => (d as any).color}
           labelResolution={2}
           backgroundColor="rgba(0,0,0,0)"

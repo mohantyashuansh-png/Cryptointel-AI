@@ -85,41 +85,45 @@
   --radius: 0.5rem;
 }
 
-/* Vibrant Dark Mode Vibe */
+/* Cinematic 3D Console Dark Mode Vibe */
 .dark {
-  --background: 240 10% 3.9%;
-  --foreground: 0 0% 98%;
-  --card: 240 10% 6%;
-  --card-foreground: 0 0% 98%;
-  --popover: 240 10% 3.9%;
-  --popover-foreground: 0 0% 98%;
+  --background: 210 16.7% 3.5%;
+  --foreground: 186 33.3% 95.5%;
+  --card: 202 25% 6.3%;
+  --card-foreground: 186 33.3% 95.5%;
+  --popover: 202 25% 6.3%;
+  --popover-foreground: 186 33.3% 95.5%;
   
-  /* Primary: Vibrant Neon Cyan/Teal */
-  --primary: 183 98% 48%;
-  --primary-foreground: 0 0% 0%;
+  /* Primary: Cyan */
+  --primary: 182 87.1% 52.4%;
+  --primary-foreground: 210 16.7% 3.5%;
   
-  --secondary: 240 3.7% 15.9%;
-  --secondary-foreground: 0 0% 98%;
-  --muted: 240 3.7% 15.9%;
-  --muted-foreground: 240 5% 64.9%;
+  /* Secondary */
+  --secondary: 198 10% 43%;
+  --secondary-foreground: 186 33.3% 95.5%;
   
-  /* Accent: Bright Purple/Pink */
-  --accent: 285 85% 65%;
-  --accent-foreground: 0 0% 100%;
+  /* Muted */
+  --muted: 202 25% 10%;
+  --muted-foreground: 195 12.3% 65.5%;
   
-  /* Destructive: Deep Red */
-  --destructive: 0 62.8% 30.6%;
-  --destructive-foreground: 0 0% 98%;
+  /* Accent: Violet */
+  --accent: 259 100% 73.3%;
+  --accent-foreground: 186 33.3% 95.5%;
   
-  --border: 240 3.7% 15.9%;
-  --input: 240 3.7% 15.9%;
-  --ring: 183 98% 48%;
+  /* Destructive: Red */
+  --destructive: 356 100% 68.4%;
+  --destructive-foreground: 186 33.3% 95.5%;
   
-  --chart-1: 183 98% 48%;
-  --chart-2: 285 85% 65%;
-  --chart-3: 240 10% 3.9%;
-  --chart-4: 0 62.8% 30.6%;
-  --chart-5: 0 0% 98%;
+  /* Border */
+  --border: 193 18% 28%;
+  --input: 193 18% 28%;
+  --ring: 182 87.1% 52.4%;
+  
+  --chart-1: 182 87.1% 52.4%;
+  --chart-2: 259 100% 73.3%;
+  --chart-3: 150 75.3% 65.5%;
+  --chart-4: 40 85.5% 65.3%;
+  --chart-5: 356 100% 68.4%;
 }
 
 @layer base {
@@ -127,6 +131,137 @@
     @apply border-border outline-ring/50;
   }
   body {
-    @apply bg-background text-foreground;
+    @apply text-foreground;
+    background:
+      linear-gradient(180deg, rgba(28, 231, 239, .09), transparent 220px),
+      radial-gradient(ellipse at 65% 18%, rgba(28, 231, 239, .12), transparent 32%),
+      linear-gradient(110deg, #050607 0%, #081012 48%, #050607 100%);
+    overflow-x: hidden;
   }
+  
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -2;
+    background:
+      linear-gradient(rgba(255,255,255,.028) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
+    background-size: 48px 48px;
+    mask-image: linear-gradient(180deg, rgba(0,0,0,.9), rgba(0,0,0,.38));
+    -webkit-mask-image: linear-gradient(180deg, rgba(0,0,0,.9), rgba(0,0,0,.38));
+    animation: gridScroll 4s linear infinite;
+  }
+  
+  body::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    background:
+      linear-gradient(90deg, rgba(0,0,0,.66), transparent 20%, transparent 78%, rgba(0,0,0,.56)),
+      linear-gradient(180deg, transparent, rgba(0,0,0,.7)),
+      repeating-linear-gradient(0deg, transparent, transparent 1px, rgba(0,0,0,0.15) 1px, rgba(0,0,0,0.15) 2px);
+  }
+}
+
+/* Scrollbar Styling */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: rgba(0,0,0,.2); }
+::-webkit-scrollbar-thumb { background: rgba(28,231,239,.4); border-radius: 999px; }
+::-webkit-scrollbar-corner { background: transparent; }
+
+/* Custom Animations */
+@keyframes gridScroll {
+  from { background-position: 0 0; }
+  to { background-position: 0 48px; }
+}
+
+@keyframes alertPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255,94,103,.7); }
+  50% { box-shadow: 0 0 0 6px rgba(255,94,103,0); }
+}
+.animate-alert-pulse { animation: alertPulse 2s infinite; }
+
+@keyframes contentEntry {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-content-entry { animation: contentEntry 0.4s cubic-bezier(0.22, 1, 0.36, 1) forwards; }
+
+@keyframes slideInRight {
+  from { transform: translateX(100%); opacity: 0; }
+  to   { transform: translateX(0); opacity: 1; }
+}
+.dossier-enter { animation: slideInRight 0.3s cubic-bezier(0.22, 1, 0.36, 1) forwards; }
+
+@keyframes rowFlash {
+  0% { background: rgba(28,231,239,.3); }
+  100% { background: transparent; }
+}
+.animate-row-flash { animation: rowFlash 0.5s ease-out; }
+
+/* Frosted Glass Panels */
+.glass-panel {
+  background: rgba(8, 12, 15, 0.88);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border: 1px solid rgba(28, 231, 239, 0.22);
+}
+
+/* Utilities */
+.text-gradient-cyan {
+  background: linear-gradient(90deg, #1ce7ef, #fff, #1ce7ef);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+
+@keyframes waveform {
+  0% { transform: scaleY(0.3); }
+  50% { transform: scaleY(1); }
+  100% { transform: scaleY(0.3); }
+}
+
+.card-cinematic {
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-left-width 0.1s ease, border-color 0.3s ease;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  position: relative;
+}
+.card-cinematic:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 0 40px -5px rgba(28,231,239,.2), inset 0 1px 0 rgba(255,255,255,.1);
+  border-left: 3px solid var(--cyan);
+}
+
+/* Staggered Row Animation */
+@keyframes rowEnter {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-row-enter {
+  animation: rowEnter 0.4s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  opacity: 0;
+}
+
+/* Threat Red Ambient */
+.ambient-red-glow {
+  box-shadow: 0 0 60px -10px rgba(255, 94, 103, 0.15) !important;
+  border-color: rgba(255, 94, 103, 0.4) !important;
+}
+
+/* Background Vignette Spotlight */
+.bg-vignette {
+  background: radial-gradient(ellipse at 50% 50%, rgba(28,231,239,0.03) 0%, transparent 70%);
+}
+
+/* Search Focus Bloom */
+.search-bloom:focus-within {
+  transform: scale(1.01);
+  box-shadow: 0 0 30px -5px rgba(28,231,239,0.2);
+  transition: all 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.search-bloom {
+  transition: all 0.3s ease;
 }
